@@ -87,11 +87,16 @@ bool run_json_import(extproc::spawner_info_t *spawner_info,
     semilattice_manager_t<cluster_semilattice_metadata_t> semilattice_manager_cluster(&semilattice_manager_client, cluster_semilattice_metadata_t());
     message_multiplexer_t::client_t::run_t semilattice_manager_client_run(&semilattice_manager_client, &semilattice_manager_cluster);
 
+    message_multiplexer_t::client_t auth_manager_client(&message_multiplexer, 'A');
+    semilattice_manager_t<auth_semilattice_metadata_t> auth_manager_cluster(&auth_manager_client, auth_semilattice_metadata_t());
+    message_multiplexer_t::client_t::run_t auth_manager_client_run(&auth_manager_client, &auth_manager_cluster);
+
     log_server_t log_server(&mailbox_manager, &log_writer);
 
     stat_manager_t stat_manager(&mailbox_manager);
 
     metadata_change_handler_t<cluster_semilattice_metadata_t> metadata_change_handler(&mailbox_manager, semilattice_manager_cluster.get_root_view());
+    metadata_change_handler_t<auth_semilattice_metadata_t> auth_change_handler(&mailbox_manager, auth_manager_cluster.get_root_view());
 
     watchable_variable_t<cluster_directory_metadata_t> our_root_directory_variable(
         cluster_directory_metadata_t(
@@ -100,6 +105,7 @@ bool run_json_import(extproc::spawner_info_t *spawner_info,
             get_ips(),
             stat_manager.get_address(),
             metadata_change_handler.get_request_mailbox_address(),
+            auth_change_handler.get_request_mailbox_address(),
             log_server.get_business_card(),
             PROXY_PEER));
 
@@ -194,6 +200,7 @@ bool run_json_import(extproc::spawner_info_t *spawner_info,
     rdb_protocol_t::context_t rdb_ctx(&extproc_pool_group,
                                       NULL,
                                       semilattice_manager_cluster.get_root_view(),
+                                      auth_manager_cluster.get_root_view(),
                                       &directory_read_manager,
                                       machine_id);
 
@@ -444,8 +451,7 @@ bool do_json_importation(namespace_repo_t<rdb_protocol_t> *repo,
             boost::shared_ptr<scoped_cJSON_t> json_copy_fml(new scoped_cJSON_t(json.DeepCopy()));
 
             rdb_protocol_t::point_write_t point_write(key, json_copy_fml, false);
-            rdb_protocol_t::write_t rdb_write;
-            rdb_write.write = point_write;
+            rdb_protocol_t::write_t rdb_write(point_write, DURABILITY_REQUIREMENT_SOFT);
             rdb_protocol_t::write_response_t response;
             ni->write(rdb_write, &response, order_source.check_in("do_json_importation"), interruptor);
 

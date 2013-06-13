@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <list>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,7 +29,6 @@
 #include "rdb_protocol/exceptions.hpp"
 #include "rdb_protocol/func.hpp"
 #include "rdb_protocol/rdb_protocol_json.hpp"
-#include "rdb_protocol/serializable_environment.hpp"
 #include "utils.hpp"
 
 class cluster_directory_metadata_t;
@@ -44,7 +44,6 @@ class traversal_progress_combiner_t;
 
 namespace extproc { class pool_group_t; }
 
-using query_language::scopes_t;
 using query_language::backtrace_t;
 using query_language::shared_scoped_less_t;
 using query_language::runtime_exc_t;
@@ -88,11 +87,10 @@ typedef boost::variant<ql::map_wire_func_t,
 
 struct transform_atom_t {
     transform_atom_t() { }
-    transform_atom_t(const transform_variant_t &tv, const scopes_t &s, const backtrace_t &b) :
-        variant(tv), scopes(s), backtrace(b) { }
+    transform_atom_t(const transform_variant_t &tv, const backtrace_t &b) :
+        variant(tv), backtrace(b) { }
 
     transform_variant_t variant;
-    scopes_t scopes;
     backtrace_t backtrace;
 };
 
@@ -106,11 +104,10 @@ typedef boost::variant<ql::gmr_wire_func_t,
 
 struct terminal_t {
     terminal_t() { }
-    terminal_t(const terminal_variant_t &tv, const scopes_t &s, const backtrace_t &b) :
-        variant(tv), scopes(s), backtrace(b) { }
+    terminal_t(const terminal_variant_t &tv, const backtrace_t &b) :
+        variant(tv), backtrace(b) { }
 
     terminal_variant_t variant;
-    scopes_t scopes;
     backtrace_t backtrace;
 };
 
@@ -127,6 +124,7 @@ void bring_sindexes_up_to_date(
 
 
 class cluster_semilattice_metadata_t;
+class auth_semilattice_metadata_t;
 
 struct rdb_protocol_t {
     static const size_t MAX_PRIMARY_KEY_SIZE = 128;
@@ -146,7 +144,8 @@ struct rdb_protocol_t {
         context_t();
         context_t(extproc::pool_group_t *_pool_group,
                   namespace_repo_t<rdb_protocol_t> *_ns_repo,
-                  boost::shared_ptr<semilattice_readwrite_view_t<cluster_semilattice_metadata_t> > _semilattice_metadata,
+                  boost::shared_ptr<semilattice_readwrite_view_t<cluster_semilattice_metadata_t> > _cluster_metadata,
+                  boost::shared_ptr<semilattice_readwrite_view_t<auth_semilattice_metadata_t> > _auth_metadata,
                   directory_read_manager_t<cluster_directory_metadata_t> *_directory_read_manager,
                   uuid_u _machine_id);
         ~context_t();
@@ -158,7 +157,8 @@ struct rdb_protocol_t {
          * ie cross_thread_namespace_watchables[0] is a watchable for thread 0. */
         scoped_array_t<scoped_ptr_t<cross_thread_watchable_variable_t<cow_ptr_t<namespaces_semilattice_metadata_t<rdb_protocol_t> > > > > cross_thread_namespace_watchables;
         scoped_array_t<scoped_ptr_t<cross_thread_watchable_variable_t<databases_semilattice_metadata_t> > > cross_thread_database_watchables;
-        boost::shared_ptr<semilattice_readwrite_view_t<cluster_semilattice_metadata_t> > semilattice_metadata;
+        boost::shared_ptr<semilattice_readwrite_view_t<cluster_semilattice_metadata_t> > cluster_metadata;
+        boost::shared_ptr<semilattice_readwrite_view_t<auth_semilattice_metadata_t> > auth_metadata;
         directory_read_manager_t<cluster_directory_metadata_t> *directory_read_manager;
         cond_t interruptor; //TODO figure out where we're going to want to interrupt this from and put this there instead
         scoped_array_t<scoped_ptr_t<cross_thread_signal_t> > signals;
@@ -576,6 +576,8 @@ struct rdb_protocol_t {
                        sindex_create_t,
                        sindex_drop_t> write;
 
+        durability_requirement_t durability_requirement;
+
         region_t get_region() const THROWS_NOTHING;
         // Returns true if the write had any side effects applicable to the region, and a
         // non-empty write was written to write_out.
@@ -583,13 +585,23 @@ struct rdb_protocol_t {
                    write_t *write_out) const THROWS_NOTHING;
         void unshard(const write_response_t *responses, size_t count, write_response_t *response, context_t *cache, signal_t *) const THROWS_NOTHING;
 
-        write_t() { }
-        explicit write_t(const point_replace_t &r) : write(r) { }
-        explicit write_t(const batched_replaces_t &br) : write(br) { }
-        explicit write_t(const point_write_t &w) : write(w) { }
-        explicit write_t(const point_delete_t &d) : write(d) { }
-        explicit write_t(const sindex_create_t &c) : write(c) { }
-        explicit write_t(const sindex_drop_t &c) : write(c) { }
+        durability_requirement_t durability() const { return durability_requirement; }
+
+        write_t() : durability_requirement(DURABILITY_REQUIREMENT_DEFAULT) { }
+        explicit write_t(const point_replace_t &r, durability_requirement_t durability)
+            : write(r), durability_requirement(durability) { }
+        explicit write_t(const batched_replaces_t &br, durability_requirement_t durability)
+            : write(br), durability_requirement(durability) { }
+        explicit write_t(const point_write_t &w,
+                         durability_requirement_t durability)
+            : write(w), durability_requirement(durability) { }
+        explicit write_t(const point_delete_t &d,
+                         durability_requirement_t durability)
+            : write(d), durability_requirement(durability) { }
+        explicit write_t(const sindex_create_t &c)
+            : write(c), durability_requirement(DURABILITY_REQUIREMENT_DEFAULT) { }
+        explicit write_t(const sindex_drop_t &c)
+            : write(c), durability_requirement(DURABILITY_REQUIREMENT_DEFAULT) { }
 
         RDB_DECLARE_ME_SERIALIZABLE;
     };
@@ -712,7 +724,8 @@ struct rdb_protocol_t {
                                  btree_slice_t *btree,
                                  transaction_t *txn,
                                  superblock_t *superblock,
-                                 write_token_pair_t *token_pair);
+                                 write_token_pair_t *token_pair,
+                                 signal_t *interruptor);
         context_t *ctx;
     };
 

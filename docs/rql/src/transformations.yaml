@@ -10,7 +10,10 @@ commands:
     description: Transform each element of the sequence by applying the given mapping
       function.
 
-    body: mapping_function
+    body:
+      js: mappingFunction
+      py: mapping_function
+      rb: mapping_function
     parent: sequence
     returns: sequence
 
@@ -29,20 +32,39 @@ commands:
              hero[:combat_power] + hero[:compassion_power] * 2
             }.run(conn)
 
-    js:
-      body: mappingFunction
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
+  - tag: with_fields
+    section: transformations
+    description: Takes a sequence of objects and a list of fields.  If any objects in the sequence don't have all of the specified fields, they're dropped from the sequence.  The remaining objects have the specified fields plucked out.  (This is identical to `has_fields` followed by `pluck` on a sequence.)
 
+    name:
+      js: withFields
+      py: with_fields
+      rb: with_fields
+
+    body: field1[, field2...]
+    parent: sequence
+    returns: sequence
+
+    examples:
+      - description: Get a list of heroes and their arch-nemeses, excluding any heroes that lack one.
+        code:
+          rb: r.table('marvel').with_fields('id', 'nemesis')
+          py: r.table('marvel').with_fields('id', 'nemesis')
+          js: r.table('marvel').withFields('id', 'nemesis')
 
   - tag: concat_map
     section: transformations
     description: Flattens a sequence of arrays returned by the <code>mappingFunction</code>
       into a single sequence.
 
-    body: mapping_function
+    name:
+      js: concatMap
+      py: concat_map
+      rb: concat_map
+    body:
+      js: mappingFunction
+      py: mapping_function
+      rb: mapping_function
     parent: sequence
     returns: sequence
 
@@ -61,20 +83,17 @@ commands:
               hero[:defeated_monsters]
             }.run(conn)
 
-    js:
-      name: concatMap
-      body: mappingFunction
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
-
   - tag: order_by
     section: transformations
     description: Sort the sequence by document values of the given key(s).<br /><br />
       <code>order by</code> defaults to ascending ordering. To explicitly specify
       the ordering, wrap the attribute with either <code>r.asc</code> or <code>r.desc</code>.
 
+    name:
+      js: orderBy
+      py: order_by
+      rb: order_by
+    
     body: key1, [key2...]
     parent: sequence
     returns: sequence
@@ -97,16 +116,6 @@ commands:
             r.table('marvel').order_by(r.desc(:enemies_vanquished),
                                        r.asc(:damsels_saved)      ).run(conn)
 
-    js:
-      name: orderBy
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
-        1:
-          can_try: true
-          dataset: marvel
-
   - tag: skip
     section: transformations
     description: Skip a number of elements from the head of the sequence.
@@ -123,11 +132,6 @@ commands:
           py: r.table('marvel').order_by('successMetric').skip(10).run(conn)
           rb: r.table('marvel').order_by(:success_metric).skip(10).run(conn)
 
-    js:
-      0:
-        can_try: true
-        dataset: marvel
-
   - tag: limit
     section: transformations
     description: End the sequence after the given number of elements.
@@ -142,12 +146,6 @@ commands:
           js: r.table('marvel').orderBy('belovedness').limit(10).run(conn, callback)
           py: r.table('marvel').order_by('belovedness').limit(10).run(conn)
           rb: r.table('marvel').order_by(:belovedness).limit(10).run(conn)
-
-    js:
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
 
   - tag: slice
     section: transformations
@@ -176,11 +174,6 @@ commands:
       name1: '['
       name2: ']'
 
-    js:
-      0:
-        can_try: true
-        dataset: marvel
-
   - tag: nth
     section: transformations
     description: Get the nth element of a sequence.
@@ -208,27 +201,87 @@ commands:
       name1: '['
       name2: ']'
 
-    js:
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
+  - tag: indexes_of
+    section: transformations
+    description: Get the indexes of an element in a sequence. If the argument is a predicate,
+      get the indexes of all elements matching it.
+
+    name:
+      js: indexesOf
+      py: indexes_of
+      rb: indexes_of
+    body: datum | predicate
+    parent: sequence
+    returns: sequence
+
+    examples:
+      - description: Find the position of the letter 'c'.
+        code:
+          js: r.expr(['a','b','c']).indexesOf('c').run(conn, callback)
+          py: r.expr(['a','b','c']).indexes_of('c').run(conn)
+          rb: r(['a','b','c']).indexes_of('c').run(conn)
+      - description: Find the popularity ranking of invisible heroes.
+        code:
+          py: |-
+            r.table('marvel').union(r.table('dc')).order_by('popularity').indexes_of(
+              r.row['superpowers'].contains('invisibility')
+            ).run(conn)
+          js: |-
+            r.table('marvel').union(r.table('dc')).orderBy('popularity').indexesOf(
+              r.row('superpowers').contains('invisibility')
+            ).run(conn, callback)
+          rb: |-
+            r.table('marvel').union(r.table('dc')).order_by(:popularity).indexes_of{
+              |row| row[:superpowers].contains('invisibility')
+            }.run(conn)
+
+  - tag: is_empty
+    section: transformations
+    description: Test if a sequence is empty.
+
+    name:
+      js: isEmpty
+      py: is_empty
+      rb: is_empty
+    parent: sequence
+    returns: json
+
+    examples:
+      - description: Are there any documents in the marvel table?
+        code:
+          js: r.table('marvel').isEmpty().run(conn, callback)
+          py: r.table('marvel').is_empty().run(conn)
+          rb: r.table('marvel').is_empty().run(conn)
 
   - tag: union
     section: transformations
     description: Concatenate two sequences.
 
-    body: other
+    body: sequence
     parent: sequence
     returns: sequence
 
     examples:
       - description: Construct a stream of all heroes.
-        code: r.table('marvel').union(r.table('dc')).run(conn)
+        code:
+          py: r.table('marvel').union(r.table('dc')).run(conn)
+          rb: r.table('marvel').union(r.table('dc')).run(conn)
+          js: r.table('marvel').union(r.table('dc')).run(conn, callback)
 
-    js:
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
-          code: r.table('marvel').union(r.table('dc')).run(conn, callback)
+  - tag: sample
+    section: transformations
+    description: |
+      Select a given number of elements from a sequence with uniform random
+      distribution. Selection is done without replacement.
+
+    body: number
+    parent: sequence
+    returns: sequence
+
+    examples:
+      - description: Select 3 random heroes.
+        code:
+          js: r.table('marvel').sample(3).run(conn, callback)
+          rb: r.table('marvel').sample(3).run(conn)
+          py: r.table('marvel').sample(3).run(conn)
+

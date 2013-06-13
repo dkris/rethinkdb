@@ -94,8 +94,8 @@ RDB_IMPL_PROTOB_SERIALIZABLE(Datum);
 namespace rdb_protocol_details {
 
 RDB_IMPL_SERIALIZABLE_3(backfill_atom_t, key, value, recency);
-RDB_IMPL_SERIALIZABLE_3(transform_atom_t, variant, scopes, backtrace);
-RDB_IMPL_SERIALIZABLE_3(terminal_t, variant, scopes, backtrace);
+RDB_IMPL_SERIALIZABLE_2(transform_atom_t, variant, backtrace);
+RDB_IMPL_SERIALIZABLE_2(terminal_t, variant, backtrace);
 
 void post_construct_and_drain_queue(
         const std::set<uuid_u> &sindexes_to_bring_up_to_date,
@@ -150,6 +150,26 @@ void bring_sindexes_up_to_date(
                 auto_drainer_t::lock_t(&store->drainer)));
 }
 
+class apply_sindex_change_visitor_t : public boost::static_visitor<> {
+public:
+    apply_sindex_change_visitor_t(const sindex_access_vector_t *sindexes,
+            transaction_t *txn,
+            signal_t *interruptor)
+        : sindexes_(sindexes), txn_(txn), interruptor_(interruptor) { }
+    void operator()(const rdb_modification_report_t &mod_report) const {
+        rdb_update_sindexes(*sindexes_, &mod_report, txn_);
+    }
+
+    void operator()(const rdb_erase_range_report_t &erase_range_report) const {
+        rdb_erase_range_sindexes(*sindexes_, &erase_range_report, txn_, interruptor_);
+    }
+
+private:
+    const sindex_access_vector_t *sindexes_;
+    transaction_t *txn_;
+    signal_t *interruptor_;
+};
+
 /* This function is really part of the logic of bring_sindexes_up_to_date
  * however it needs to be in a seperate function so that it can be spawned in a
  * coro. */
@@ -180,7 +200,7 @@ void post_construct_and_drain_queue(
                 repli_timestamp_t::distant_past,
                 2,
                 WRITE_DURABILITY_SOFT,
-                &token_pair.main_write_token,
+                &token_pair,
                 &queue_txn,
                 &queue_superblock,
                 lock.get_drain_signal());
@@ -213,11 +233,12 @@ void post_construct_and_drain_queue(
                 mod_queue->pop(&data_vec);
                 vector_read_stream_t read_stream(&data_vec);
 
-                rdb_modification_report_t mod_report;
-                int ser_res = deserialize(&read_stream, &mod_report);
+                rdb_sindex_change_t sindex_change;
+                int ser_res = deserialize(&read_stream, &sindex_change);
                 guarantee_err(ser_res == 0, "corruption in disk-backed queue");
 
-                rdb_update_sindexes(sindexes, &mod_report, queue_txn.get());
+                boost::apply_visitor(apply_sindex_change_visitor_t(&sindexes, queue_txn.get(), lock.get_drain_signal()),
+                                     sindex_change);
             }
 
             previous_size = mod_queue->size();
@@ -255,7 +276,7 @@ void post_construct_and_drain_queue(
             repli_timestamp_t::distant_past,
             2,
             WRITE_DURABILITY_HARD,
-            &token_pair.main_write_token,
+            &token_pair,
             &queue_txn,
             &queue_superblock,
             lock.get_drain_signal());
@@ -281,6 +302,10 @@ bool range_key_tester_t::key_should_be_erased(const btree_key_t *key) {
         && delete_range->inner.contains_key(key->contents, key->size);
 }
 
+typedef boost::variant<rdb_modification_report_t, 
+                       rdb_erase_range_report_t> 
+        sindex_change_t;
+
 }  // namespace rdb_protocol_details
 
 rdb_protocol_t::context_t::context_t()
@@ -295,14 +320,17 @@ rdb_protocol_t::context_t::context_t(
     extproc::pool_group_t *_pool_group,
     namespace_repo_t<rdb_protocol_t> *_ns_repo,
     boost::shared_ptr<semilattice_readwrite_view_t<cluster_semilattice_metadata_t> >
-        _semilattice_metadata,
+        _cluster_metadata,
+    boost::shared_ptr<semilattice_readwrite_view_t<auth_semilattice_metadata_t> >
+        _auth_metadata,
     directory_read_manager_t<cluster_directory_metadata_t>
         *_directory_read_manager,
     machine_id_t _machine_id)
     : pool_group(_pool_group), ns_repo(_ns_repo),
       cross_thread_namespace_watchables(get_num_threads()),
       cross_thread_database_watchables(get_num_threads()),
-      semilattice_metadata(_semilattice_metadata),
+      cluster_metadata(_cluster_metadata),
+      auth_metadata(_auth_metadata),
       directory_read_manager(_directory_read_manager),
       signals(get_num_threads()),
       machine_id(_machine_id)
@@ -311,12 +339,12 @@ rdb_protocol_t::context_t::context_t(
         cross_thread_namespace_watchables[thread].init(new cross_thread_watchable_variable_t<cow_ptr_t<namespaces_semilattice_metadata_t<rdb_protocol_t> > >(
                                                     clone_ptr_t<semilattice_watchable_t<cow_ptr_t<namespaces_semilattice_metadata_t<rdb_protocol_t> > > >
                                                         (new semilattice_watchable_t<cow_ptr_t<namespaces_semilattice_metadata_t<rdb_protocol_t> > >(
-                                                            metadata_field(&cluster_semilattice_metadata_t::rdb_namespaces, _semilattice_metadata))), thread));
+                                                            metadata_field(&cluster_semilattice_metadata_t::rdb_namespaces, _cluster_metadata))), thread));
 
         cross_thread_database_watchables[thread].init(new cross_thread_watchable_variable_t<databases_semilattice_metadata_t>(
                                                     clone_ptr_t<semilattice_watchable_t<databases_semilattice_metadata_t> >
                                                         (new semilattice_watchable_t<databases_semilattice_metadata_t>(
-                                                            metadata_field(&cluster_semilattice_metadata_t::databases, _semilattice_metadata))), thread));
+                                                            metadata_field(&cluster_semilattice_metadata_t::databases, _cluster_metadata))), thread));
 
         signals[thread].init(new cross_thread_signal_t(&interruptor, thread));
     }
@@ -488,7 +516,7 @@ public:
                      ->get_watchable(),
                  ctx->cross_thread_database_watchables[get_thread_id()].get()
                      ->get_watchable(),
-                 ctx->semilattice_metadata,
+                 ctx->cluster_metadata,
                  NULL,
                  boost::make_shared<js::runner_t>(),
                  interruptor,
@@ -640,8 +668,7 @@ public:
                 } catch (const ql::datum_exc_t &e) {
                     /* Evaluation threw so we're not going to be accepting any
                        more requests. */
-                    const ql::terminal_exc_visitor_t visitor(e, &rg_response->result);
-                    boost::apply_visitor(visitor, rg.terminal->variant);
+                    terminal_exception(e, rg.terminal->variant, &rg_response->result);
                 }
             }
         } catch (const runtime_exc_t &e) {
@@ -760,8 +787,8 @@ struct rdb_w_get_region_visitor : public boost::static_visitor<region_t> {
             return hash_region_t<key_range_t>();
         }
 
-        store_key_t minimum_key = store_key_t::min();
-        store_key_t maximum_key = store_key_t::max();
+        store_key_t minimum_key = store_key_t::max();
+        store_key_t maximum_key = store_key_t::min();
         uint64_t minimum_hash_value = HASH_REGION_HASH_SIZE - 1;
         uint64_t maximum_hash_value = 0;
 
@@ -811,13 +838,16 @@ region_t write_t::get_region() const THROWS_NOTHING {
 
 struct rdb_w_shard_visitor_t : public boost::static_visitor<bool> {
     rdb_w_shard_visitor_t(const region_t *_region,
+                          durability_requirement_t _durability_requirement,
                           write_t *_write_out)
-        : region(_region), write_out(_write_out) {}
+        : region(_region),
+          durability_requirement(_durability_requirement),
+          write_out(_write_out) {}
 
     template <class T>
     bool keyed_write(const T &arg) const {
         if (region_contains_key(*region, arg.key)) {
-            *write_out = write_t(arg);
+            *write_out = write_t(arg, durability_requirement);
             return true;
         } else {
             return false;
@@ -838,7 +868,7 @@ struct rdb_w_shard_visitor_t : public boost::static_visitor<bool> {
         }
 
         if (!sharded_replaces.empty()) {
-            *write_out = write_t(batched_replaces_t());
+            *write_out = write_t(batched_replaces_t(), durability_requirement);
             batched_replaces_t *batched = boost::get<batched_replaces_t>(&write_out->write);
             batched->point_replaces.swap(sharded_replaces);
             return true;
@@ -878,12 +908,14 @@ struct rdb_w_shard_visitor_t : public boost::static_visitor<bool> {
     }
 
     const region_t *region;
+    durability_requirement_t durability_requirement;
     write_t *write_out;
 };
 
 bool write_t::shard(const region_t &region,
                     write_t *write_out) const THROWS_NOTHING {
-    return boost::apply_visitor(rdb_w_shard_visitor_t(&region, write_out), write);
+    const rdb_w_shard_visitor_t v(&region, durability_requirement, write_out);
+    return boost::apply_visitor(v, write);
 }
 
 template <class T>
@@ -1030,12 +1062,14 @@ struct rdb_read_visitor_t : public boost::static_visitor<void> {
 
                 if (!found) {
                     res->result = ql::datum_exc_t(
+                        ql::base_exc_t::GENERIC,
                         strprintf("Index `%s` was not found.",
                                   rget.sindex->c_str()));
                     return;
                 }
             } catch (const sindex_not_post_constructed_exc_t &) {
                 res->result = ql::datum_exc_t(
+                    ql::base_exc_t::GENERIC,
                     strprintf("Index `%s` was accessed before "
                               "its construction was finished.",
                               rget.sindex->c_str()));
@@ -1078,13 +1112,13 @@ struct rdb_read_visitor_t : public boost::static_visitor<void> {
                   NVAR(arg1)));
 
             Backtrace dummy_backtrace;
-            ql::term_walker_t(&filter_term, &dummy_backtrace);
+            ql::propagate_backtrace(&filter_term, &dummy_backtrace);
             ql::filter_wire_func_t sindex_filter(filter_term, std::map<int64_t, Datum>());
 
             // We then add this new filter to the beginning of the transform stack
             rdb_protocol_details::transform_t sindex_transform(rget.transform);
             sindex_transform.push_front(rdb_protocol_details::transform_atom_t(
-                                            sindex_filter, scopes_t(), backtrace_t()));
+                                            sindex_filter, backtrace_t()));
 
             rdb_rget_secondary_slice(
                     store->get_sindex_slice(*rget.sindex),
@@ -1150,7 +1184,7 @@ struct rdb_read_visitor_t : public boost::static_visitor<void> {
                    ->get_watchable(),
                ctx->cross_thread_database_watchables[get_thread_id()].get()
                    ->get_watchable(),
-               ctx->semilattice_metadata,
+               ctx->cluster_metadata,
                NULL,
                boost::make_shared<js::runner_t>(),
                &interruptor,
@@ -1183,7 +1217,14 @@ void store_t::protocol_read(const read_t &read,
 // TODO: get rid of this extra response_t copy on the stack
 struct rdb_write_visitor_t : public boost::static_visitor<void> {
     void operator()(const point_replace_t &r) {
-        ql_env.init_optargs(r.optargs);
+        try {
+            ql_env.init_optargs(r.optargs);
+        } catch (const interrupted_exc_t &) {
+            // Clear the sindex_write_token because we didn't have a chance to use it
+            token_pair->sindex_write_token.reset();
+            throw;
+        }
+
         response->response = point_replace_response_t();
         point_replace_response_t *res = boost::get<point_replace_response_t>(&response->response);
         // TODO: modify surrounding code so we can dump this const_cast.
@@ -1296,7 +1337,7 @@ struct rdb_write_visitor_t : public boost::static_visitor<void> {
                    get_thread_id()].get()->get_watchable(),
                ctx->cross_thread_database_watchables[
                    get_thread_id()].get()->get_watchable(),
-               ctx->semilattice_metadata,
+               ctx->cluster_metadata,
                0,
                boost::make_shared<js::runner_t>(),
                &interruptor,
@@ -1308,14 +1349,16 @@ struct rdb_write_visitor_t : public boost::static_visitor<void> {
 private:
     void update_sindexes(const rdb_modification_report_t *mod_report) {
         scoped_ptr_t<buf_lock_t> sindex_block;
+        // Don't allow interruption here, or we may end up with inconsistent data
+        cond_t dummy_interruptor;
         store->acquire_sindex_block_for_write(token_pair, txn, &sindex_block,
-                                              sindex_block_id, &interruptor);
+                                              sindex_block_id, &dummy_interruptor);
 
         mutex_t::acq_t acq;
         store->lock_sindex_queue(sindex_block.get(), &acq);
 
         write_message_t wm;
-        wm << *mod_report;
+        wm << rdb_sindex_change_t(*mod_report);
         store->sindex_queue_push(wm, &acq);
 
         sindex_access_vector_t sindexes;
@@ -1465,12 +1508,8 @@ struct rdb_receive_backfill_visitor_t : public boost::static_visitor<void> {
 
     void operator()(const backfill_chunk_t::delete_range_t& delete_range) const {
         range_key_tester_t tester(&delete_range.range);
-        rdb_modification_report_cb_t sindex_cb(
-            store, token_pair, txn,
-            superblock->get_sindex_block_id(),
-            auto_drainer_t::lock_t(&store->drainer));
-
-        rdb_erase_range(btree, &tester, delete_range.range.inner, txn, superblock, &sindex_cb);
+        rdb_erase_range(btree, &tester, delete_range.range.inner, txn, superblock,
+                store, token_pair, interruptor);
     }
 
     void operator()(const backfill_chunk_t::key_value_pair_t& kv) const {
@@ -1492,29 +1531,33 @@ struct rdb_receive_backfill_visitor_t : public boost::static_visitor<void> {
         std::set<std::string> created_sindexes;
         store->set_sindexes(token_pair, s.sindexes, txn, superblock, &sizer, &deleter, &sindex_block, &created_sindexes, interruptor);
 
-        sindex_access_vector_t sindexes;
-        store->acquire_sindex_superblocks_for_write(
-                created_sindexes,
-                sindex_block.get(),
-                txn,
-                &sindexes);
+        if (!created_sindexes.empty()) {
+            sindex_access_vector_t sindexes;
+            store->acquire_sindex_superblocks_for_write(
+                    created_sindexes,
+                    sindex_block.get(),
+                    txn,
+                    &sindexes);
 
-        rdb_protocol_details::bring_sindexes_up_to_date(created_sindexes, store,
-                sindex_block.get(), txn);
+            rdb_protocol_details::bring_sindexes_up_to_date(created_sindexes, store,
+                    sindex_block.get(), txn);
+        }
     }
 
 private:
     void update_sindexes(rdb_modification_report_t *mod_report) const {
         scoped_ptr_t<buf_lock_t> sindex_block;
+        // Don't allow interruption here, or we may end up with inconsistent data
+        cond_t dummy_interruptor;
         store->acquire_sindex_block_for_write(
             token_pair, txn, &sindex_block,
-            sindex_block_id, interruptor);
+            sindex_block_id, &dummy_interruptor);
 
         mutex_t::acq_t acq;
         store->lock_sindex_queue(sindex_block.get(), &acq);
 
         write_message_t wm;
-        wm << *mod_report;
+        wm << rdb_sindex_change_t(*mod_report);
         store->sindex_queue_push(wm, &acq);
 
         sindex_access_vector_t sindexes;
@@ -1545,18 +1588,13 @@ void store_t::protocol_reset_data(const region_t& subregion,
                                   btree_slice_t *btree,
                                   transaction_t *txn,
                                   superblock_t *superblock,
-                                  write_token_pair_t *token_pair) {
+                                  write_token_pair_t *token_pair,
+                                  signal_t *interruptor) {
     value_sizer_t<rdb_value_t> sizer(txn->get_cache()->get_block_size());
     rdb_value_deleter_t deleter;
 
     always_true_key_tester_t key_tester;
-
-    rdb_modification_report_cb_t sindex_cb(
-            this, token_pair, txn,
-            superblock->get_sindex_block_id(), 
-            auto_drainer_t::lock_t(&drainer));
-
-    rdb_erase_range(btree, &key_tester, subregion.inner, txn, superblock, &sindex_cb);
+    rdb_erase_range(btree, &key_tester, subregion.inner, txn, superblock, this, token_pair, interruptor);
 }
 
 region_t rdb_protocol_t::cpu_sharding_subspace(int subregion_number,
@@ -1610,7 +1648,7 @@ RDB_IMPL_ME_SERIALIZABLE_1(rdb_protocol_t::point_delete_t, key);
 RDB_IMPL_ME_SERIALIZABLE_3(rdb_protocol_t::sindex_create_t, id, mapping, region);
 RDB_IMPL_ME_SERIALIZABLE_2(rdb_protocol_t::sindex_drop_t, id, region);
 
-RDB_IMPL_ME_SERIALIZABLE_1(rdb_protocol_t::write_t, write);
+RDB_IMPL_ME_SERIALIZABLE_2(rdb_protocol_t::write_t, write, durability_requirement);
 RDB_IMPL_ME_SERIALIZABLE_1(rdb_protocol_t::backfill_chunk_t::delete_key_t, key);
 
 RDB_IMPL_ME_SERIALIZABLE_1(rdb_protocol_t::backfill_chunk_t::delete_range_t, range);

@@ -1,36 +1,71 @@
 #include "rdb_protocol/error.hpp"
 
 #include "backtrace.hpp"
+#include "rdb_protocol/datum.hpp"
 #include "rdb_protocol/term_walker.hpp"
+#include "rdb_protocol/val.hpp"
 
 namespace ql {
-void runtime_check(DEBUG_VAR const char *test, DEBUG_VAR const char *file,
-                   DEBUG_VAR int line, bool pred,
+
+#ifdef RQL_ERROR_BT
+#define RQL_ERROR_VAR
+#else
+#define RQL_ERROR_VAR __attribute__((unused))
+#endif
+
+void runtime_check(base_exc_t::type_t type,
+                   RQL_ERROR_VAR const char *test, RQL_ERROR_VAR const char *file,
+                   RQL_ERROR_VAR int line, bool pred,
                    std::string msg, const Backtrace *bt_src,
                    int dummy_frames) {
     if (pred) return;
-#ifndef NDEBUG
+#ifdef RQL_ERROR_BT
     msg = strprintf("%s\nFailed assertion: %s\nAt: %s:%d",
                     msg.c_str(), test, file, line);
 #endif
-    throw exc_t(msg, bt_src, dummy_frames);
+    throw exc_t(type, msg, bt_src, dummy_frames);
 }
-void runtime_check(DEBUG_VAR const char *test, DEBUG_VAR const char *file,
-                   DEBUG_VAR int line, bool pred, std::string msg) {
+void runtime_check(base_exc_t::type_t type,
+                   RQL_ERROR_VAR const char *test, RQL_ERROR_VAR const char *file,
+                   RQL_ERROR_VAR int line, bool pred, std::string msg) {
     if (pred) return;
-#ifndef NDEBUG
+#ifdef RQL_ERROR_BT
     msg = strprintf("%s\nFailed assertion: %s\nAt: %s:%d",
                     msg.c_str(), test, file, line);
 #endif
-    throw datum_exc_t(msg);
+    throw datum_exc_t(type, msg);
 }
 
 void runtime_sanity_check(bool test) {
     if (!test) {
         lazy_backtrace_t bt;
-        throw exc_t("SANITY CHECK FAILED (server is buggy).  Backtrace:\n" + bt.addrs(),
+        throw exc_t(base_exc_t::GENERIC,
+                    "SANITY CHECK FAILED (server is buggy).  Backtrace:\n" + bt.addrs(),
                     backtrace_t());
     }
+}
+
+base_exc_t::type_t exc_type(const datum_t *d) {
+    r_sanity_check(d);
+    return d->get_type() == datum_t::R_NULL
+        ? base_exc_t::NON_EXISTENCE
+        : base_exc_t::GENERIC;
+}
+base_exc_t::type_t exc_type(const counted_t<const datum_t> &d) {
+    r_sanity_check(d.has());
+    return exc_type(d.get());
+}
+base_exc_t::type_t exc_type(val_t *v) {
+    r_sanity_check(v);
+    if (v->get_type().is_convertible(val_t::type_t::DATUM)) {
+        return exc_type(v->as_datum());
+    } else {
+        return base_exc_t::GENERIC;
+    }
+}
+base_exc_t::type_t exc_type(const counted_t<val_t> &v) {
+    r_sanity_check(v.has());
+    return exc_type(v.get());
 }
 
 void backtrace_t::fill_bt(Backtrace *bt) const {
@@ -92,7 +127,7 @@ backtrace_t::frame_t::frame_t(const Frame &f) {
 }
 
 void pb_rcheckable_t::propagate(Term *t) const {
-    term_walker_t(t, bt_src.get());
+    propagate_backtrace(t, bt_src.get());
 }
 
 } // namespace ql

@@ -65,8 +65,7 @@ class Bag(Lst):
             return False
 
         for i in xrange(len(self.lst)):
-            fun = eq(self.lst[i])
-            if not fun(other[i]):
+            if not self.lst[i] == other[i]:
                 return False
 
         return True
@@ -82,8 +81,12 @@ class Dct:
         for key in self.dct.keys():
             if not key in other.keys():
                 return False
-            fun = eq(self.dct[key])
-            if not fun(other[key]):
+            val = other[key]
+            if isinstance(val, str) or isinstance(val, unicode):
+                # Remove additional error info that creeps in in debug mode
+                val = re.sub("\nFailed assertion:.*", "", val, flags=re.M|re.S)
+            other[key] = val
+            if not self.dct[key] == other[key]:
                 return False
         return True
 
@@ -180,9 +183,6 @@ def eq(exp):
         exp = Dct(exp)
 
     def sub(val):
-        if isinstance(val, str):
-            # Remove additional error info that creeps in in debug mode
-            val = re.sub("\nFailed assertion:.*", "", val, flags=re.M|re.S)
         if not (val == exp):
             return False
         else:
@@ -199,24 +199,20 @@ class PyTestDriver:
         print 'Connecting to CPP server on port ' + str(CPPPORT)
         print ''
         self.cpp_conn = r.connect(host='localhost', port=CPPPORT)
+        r.db_create('test').run(self.cpp_conn)
         self.scope = {}
 
     def define(self, expr):
         exec(expr, globals(), self.scope)
 
-    def run(self, src, expected, name):
+    def run(self, src, expected, name, runopts):
 
         # Try to build the expected result
         if expected:
             exp_val = eval(expected, dict(globals().items() + self.scope.items()))
         else:
             # This test might not have come with an expected result, we'll just ensure it doesn't fail
-            #exp_fun = lambda v: True
             exp_val = ()
-
-        # If left off the comparison function is equality by default
-        #if not isinstance(exp_fun, types.FunctionType):
-        #    exp_fun = eq(exp_fun)
 
         # Try to build the test
         try:
@@ -234,7 +230,7 @@ class PyTestDriver:
 
         # Try actually running the test
         try:
-            cppres = query.run(self.cpp_conn)
+            cppres = query.run(self.cpp_conn, **runopts)
 
             # And comparing the expected result
             if not eq(exp_val)(cppres):
@@ -256,10 +252,10 @@ driver = PyTestDriver()
 driver.connect()
 
 # Emitted test code will consist of calls to this function
-def test(query, expected, name):
+def test(query, expected, name, runopts={}):
     if expected == '':
         expected = None
-    driver.run(query, expected, name)
+    driver.run(query, expected, name, runopts)
 
 # Emitted test code can call this function to define variables
 def define(expr):

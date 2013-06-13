@@ -67,6 +67,10 @@ def cmp_test(one, two)
     return 1
   end
 
+  if one.class == String then
+    one = one.sub(/\nFailed assertion:(.|\n)*/, "")
+  end
+
   case "#{two.class}"
   when "Err"
     if one.kind_of? Exception
@@ -134,12 +138,14 @@ $defines = eval_env
 
 # $js_conn = RethinkDB::Connection.new('localhost', JSPORT)
 
-$cpp_conn = RethinkDB::Connection.new('localhost', CPPPORT)
+$cpp_conn = RethinkDB::Connection.new(:host => 'localhost', :port => CPPPORT)
+r.db_create('test').run($cpp_conn)
 
 $test_count = 0
 $success_count = 0
 
-def test src, expected, name
+def test src, expected, name, opthash=nil
+  $opthash = opthash
   $test_count += 1
   begin
     query = eval src, $defines
@@ -162,7 +168,11 @@ end
 
 def do_test query, expected, con, name, src
   begin
-    res = query.run(con)
+    if $opthash
+      res = query.run(con, $opthash)
+    else
+      res = query.run(con)
+    end
   rescue Exception => exc
     res = err(exc.class.name.sub(/^RethinkDB::/, ""), exc.message.split("\n")[0], "TODO")
   end

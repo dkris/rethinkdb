@@ -41,12 +41,13 @@ class Cursor(object):
         self.conn._end(self.query, self.term)
 
 class Connection(object):
-    def __init__(self, host, port, db=None):
+    def __init__(self, host, port, db=None, auth_key=""):
         self.socket = None
         self.host = host
         self.port = port
         self.next_token = 1
         self.db = db
+        self.auth_key = auth_key
         self.reconnect()
 
     def __enter__(self):
@@ -65,7 +66,19 @@ class Connection(object):
         except Exception as err:
             raise RqlDriverError("Could not connect to %s:%s." % (self.host, self.port))
 
-        self.socket.sendall(struct.pack("<L", p.VersionDummy.V0_1))
+        self.socket.sendall(struct.pack("<L", p.VersionDummy.V0_2))
+        self.socket.sendall(struct.pack("<L", len(self.auth_key)) + self.auth_key)
+
+        # Read out the response from the server, which will be a null-terminated string
+        response = ""
+        while True:
+            char = self.socket.recv(1)
+            if char == "\0":
+                break
+            response += char
+
+        if response != "SUCCESS":
+            raise RqlDriverError("Server dropped connection with message: \"%s\"" % response.strip())
 
     def close(self):
         if self.socket:
@@ -104,9 +117,13 @@ class Connection(object):
             pair.key = k
             expr(v).build(pair.val)
 
+        noreply = False
+        if 'noreply' in global_opt_args:
+            noreply = global_opt_args['noreply']
+
         # Compile query to protobuf
         term.build(query.query)
-        return self._send_query(query, term)
+        return self._send_query(query, term, noreply)
 
     def _continue(self, orig_query, orig_term):
         query = p.Query()
@@ -120,7 +137,7 @@ class Connection(object):
         query.token = orig_query.token
         return self._send_query(query, orig_term)
 
-    def _send_query(self, query, term):
+    def _send_query(self, query, term, noreply=False):
 
         # Error if this connection has closed
         if not self.socket:
@@ -130,6 +147,9 @@ class Connection(object):
         query_protobuf = query.SerializeToString()
         query_header = struct.pack("<L", len(query_protobuf))
         self.socket.sendall(query_header + query_protobuf)
+
+        if noreply:
+            return None
 
         # Get response
         response_buf = ''
@@ -196,5 +216,5 @@ class Connection(object):
         else:
             raise RqlDriverError("Unknown Response type %d encountered in response." % response.type)
 
-def connect(host='localhost', port=28015, db=None):
-    return Connection(host, port, db)
+def connect(host='localhost', port=28015, db=None, auth_key=""):
+    return Connection(host, port, db, auth_key)

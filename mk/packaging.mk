@@ -220,14 +220,12 @@ reset-dist-dir: FORCE | web-assets
 	$P CP $(DIST_FILE_LIST) $(DIST_DIR)
 	rm -rf $(PROTOC_JS_PLUGIN)
 	$(EXTERN_MAKE) -C $(TOP)/external/gtest/make clean
-	$(EXTERN_MAKE) -C $(TOP)/external/protobuf-plugin-closure clean
 	rm -rf $(DIST_DIR)
 	mkdir -p $(DIST_DIR)
 	cp -pRP $(DIST_FILE_LIST) $(DIST_DIR)
 
 $(DIST_DIR)/custom.mk: FORCE | reset-dist-dir
 	$P ECHO "> $@"
-	echo 'CONFIGURE_FLAGS += --enable-precompiled-web' > $@
 	for line in $(DIST_CUSTOM_MK_LINES); do \
 	  echo "$$line" >> $(DIST_DIR)/custom.mk ; \
 	done

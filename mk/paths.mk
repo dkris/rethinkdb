@@ -27,10 +27,6 @@ ifeq ($(BUILD_DIR),)
     BUILD_DIR += scs
   endif
 
-  ifeq (1,$(MOCK_CACHE_CHECK))
-    BUILD_DIR += mockcache
-  endif
-
   ifeq (1,$(LEGACY_LINUX))
     BUILD_DIR += legacy
   endif
@@ -49,10 +45,6 @@ ifeq ($(BUILD_DIR),)
 
   ifeq (1,$(VALGRIND))
     BUILD_DIR += valgrind
-  endif
-
-  ifeq (1,$(AIOSUPPORT))
-    BUILD_DIR += aiosupport
   endif
 
   ifeq (1,$(NO_TCMALLOC))

@@ -18,7 +18,10 @@ commands:
       js: innerJoin
       py: inner_join
       rb: inner_join
-    body: othersequence, predicate
+    body:
+      js: otherSequence, predicate
+      py: other_sequence, predicate
+      rb: other_sequence, predicate
     parent: sequence
     returns: sequence
 
@@ -37,12 +40,6 @@ commands:
              marvel_row[:strength] < dc_row[:strength]
             }.run(conn)
 
-    js:
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
-
   - tag: outer
     section: joins
     description: Computes a left outer join by retaining each row in the left table
@@ -52,7 +49,10 @@ commands:
       js: outerJoin
       py: outer_join
       rb: outer_join
-    body: othersequence, predicate
+    body:
+      js: otherSequence, predicate
+      py: other_sequence, predicate
+      rb: other_sequence, predicate
     parent: sequence
     returns: sequence
 
@@ -73,18 +73,15 @@ commands:
              marvel_row[:strength] < dc_row[:strength]
             }.run(conn)
 
-    js:
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
-
   - tag: eqJoin
     section: joins
     description: An efficient join that looks up elements in the right table by primary
       key.
 
-    name: eq_join
+    name:
+      py: eq_join
+      rb: eq_join
+      js: eqJoin
     body:
       py: left_attr, other[, index='id']
       rb: left_attr, other[, :index => 'id']
@@ -125,16 +122,6 @@ commands:
             r.table('marvel').eqJoin('main_weapon_origin',
                 r.table('mythical_weapons'), {index:'origin'}).run(conn, callback)
 
-    js:
-      name: eqJoin
-      examples:
-        0:
-          can_try: true
-          dataset: marvel
-        1:
-          can_try: true
-          dataset: marvel
-
   - tag: zip
     section: joins
     description: Used to 'zip' up the result of a join by merging the 'right' fields into 
@@ -156,8 +143,3 @@ commands:
     rb:
       dont_need_parenthesis: true
 
-    js:
-      examples:
-        0:
-          can_try: true
-          dataset: marvel

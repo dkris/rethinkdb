@@ -41,8 +41,7 @@ void run_with_broadcaster(
     in_memory_branch_history_manager_t<rdb_protocol_t> branch_history_manager;
 
     // io backender
-    scoped_ptr_t<io_backender_t> io_backender;
-    make_io_backender(aio_default, &io_backender);
+    io_backender_t io_backender;
 
     /* Create some structures for the rdb_protocol_t::context_t, warning some
      * boilerplate is about to follow, avert your eyes if you have a weak
@@ -59,10 +58,12 @@ void run_with_broadcaster(
     directory_read_manager_t<cluster_directory_metadata_t> read_manager(&c2);
     connectivity_cluster_t::run_t cr2(&c2, get_unittest_addresses(), ANY_PORT, &read_manager, 0, NULL);
 
-    rdb_protocol_t::context_t ctx(&pool_group, NULL, slm.get_root_view(), &read_manager, generate_uuid());
+    boost::shared_ptr<semilattice_readwrite_view_t<auth_semilattice_metadata_t> > dummy_auth;
+    rdb_protocol_t::context_t ctx(&pool_group, NULL, slm.get_root_view(),
+                                  dummy_auth, &read_manager, generate_uuid());
 
     /* Set up a broadcaster and initial listener */
-    test_store_t<rdb_protocol_t> initial_store(io_backender.get(), &order_source, &ctx);
+    test_store_t<rdb_protocol_t> initial_store(&io_backender, &order_source, &ctx);
     cond_t interruptor;
 
     scoped_ptr_t<broadcaster_t<rdb_protocol_t> > broadcaster(
@@ -78,7 +79,7 @@ void run_with_broadcaster(
 
     scoped_ptr_t<listener_t<rdb_protocol_t> > initial_listener(
         new listener_t<rdb_protocol_t>(base_path_t("."), //TODO is it bad that this isn't configurable?
-                                       io_backender.get(),
+                                       &io_backender,
                                        cluster.get_mailbox_manager(),
                                        broadcaster_business_card_watchable_variable.get_watchable(),
                                        &branch_history_manager,
@@ -87,7 +88,7 @@ void run_with_broadcaster(
                                        &interruptor,
                                        &order_source));
 
-    fun(io_backender.get(),
+    fun(&io_backender,
         &cluster,
         &branch_history_manager,
         broadcaster_business_card_watchable_variable.get_watchable(),
@@ -123,7 +124,7 @@ boost::shared_ptr<scoped_cJSON_t> generate_document(const std::string &value) {
 }
 
 void write_to_broadcaster(broadcaster_t<rdb_protocol_t> *broadcaster, const std::string& key, const std::string& value, order_token_t otok, signal_t *) {
-    rdb_protocol_t::write_t write(rdb_protocol_t::point_write_t(store_key_t(key), generate_document(value), true));
+    rdb_protocol_t::write_t write(rdb_protocol_t::point_write_t(store_key_t(key), generate_document(value), true), DURABILITY_REQUIREMENT_DEFAULT);
 
     fake_fifo_enforcement_t enforce;
     fifo_enforcer_sink_t::exit_write_t exiter(&enforce.sink, enforce.source.enter_write());
@@ -207,7 +208,7 @@ void run_backfill_test(io_backender_t *io_backender,
         broadcaster->get()->read(read, &response, &exiter, order_source->check_in("unittest::(rdb)run_partial_backfill_test").with_read_mode(), &non_interruptor);
         rdb_protocol_t::point_read_response_t get_result = boost::get<rdb_protocol_t::point_read_response_t>(response.response);
         EXPECT_TRUE(get_result.data.get() != NULL);
-        EXPECT_EQ(query_language::json_cmp(generate_document(it->second)->get(), get_result.data->get()), 0);
+        EXPECT_EQ(0, query_language::json_cmp(generate_document(it->second)->get(), get_result.data->get()));
     }
 }
 
@@ -318,8 +319,8 @@ void run_sindex_backfill_test(io_backender_t *io_backender,
         rdb_protocol_t::rget_read_response_t get_result = boost::get<rdb_protocol_t::rget_read_response_t>(response.response);
         auto result_stream = boost::get<rdb_protocol_t::rget_read_response_t::stream_t>(&get_result.result);
         guarantee(result_stream);
-        ASSERT_EQ(result_stream->size(), 1u);
-        EXPECT_EQ(query_language::json_cmp(generate_document(it->second)->get(), result_stream->at(0).second->get()), 0);
+        ASSERT_EQ(1u, result_stream->size());
+        EXPECT_EQ(0, query_language::json_cmp(generate_document(it->second)->get(), result_stream->at(0).second->get()));
     }
 }
 

@@ -7,62 +7,104 @@ goog.require("Datum")
 
 class TermBase
     constructor: ->
-        self = ((field) -> self.getAttr(field))
+        self = (ar (field) -> self.getAttr(field))
         self.__proto__ = @.__proto__
         return self
 
-    run: (conn, cb) ->
+    run: (connOrOptions, cb) ->
         useOutdated = undefined
-        if conn? and typeof(conn) is 'object' and not (conn instanceof Connection)
-            useOutdated = !!conn.useOutdated
-            for own key of conn
-                unless key in ['connection', 'useOutdated']
-                    throw new RqlDriverError "First argument to `run` must be an open connection or { connection: <connection>, useOutdated: <bool> }."
-            conn = conn.connection
+
+        # Parse out run options from connOrOptions object
+        if connOrOptions? and typeof(connOrOptions) is 'object' and not (connOrOptions instanceof Connection)
+            useOutdated = !!connOrOptions.useOutdated
+            noreply = !!connOrOptions.noreply
+            for own key of connOrOptions
+                unless key in ['connection', 'useOutdated', 'noreply']
+                    throw new RqlDriverError "First argument to `run` must be an open connection or { connection: <connection>, useOutdated: <bool>, noreply: <bool>}."
+            conn = connOrOptions.connection
+        else
+            useOutdated = null
+            noreply = null
+            conn = connOrOptions
+
+        # This only checks that the argument is of the right type, connection
+        # closed errors will be handled elsewhere
         unless conn instanceof Connection
-            throw new RqlDriverError "First argument to `run` must be an open connection or { connection: <connection>, useOutdated: <bool> }."
-        unless typeof(cb) is 'function'
+            throw new RqlDriverError "First argument to `run` must be an open connection or { connection: <connection>, useOutdated: <bool>, noreply: <bool> }."
+
+        # We only require a callback if noreply isn't set
+        if not noreply and typeof(cb) isnt 'function'
             throw new RqlDriverError "Second argument to `run` must be a callback to invoke "+
                                      "with either an error or the result of the query."
-        conn._start @, cb, useOutdated
+
+        try
+            conn._start @, cb, useOutdated, noreply
+        catch e
+            # It was decided that, if we can, we prefer to invoke the callback
+            # with any errors rather than throw them as normal exceptions.
+            # Thus we catch errors here and invoke the callback instead of
+            # letting the error bubble up.
+            if typeof(cb) is 'function'
+                cb(e)
+            else
+                throw e
 
     toString: -> RqlQueryPrinter::printQuery(@)
 
 class RDBVal extends TermBase
-    eq: (others...) -> new Eq {}, @, others...
-    ne: (others...) -> new Ne {}, @, others...
-    lt: (others...) -> new Lt {}, @, others...
-    le: (others...) -> new Le {}, @, others...
-    gt: (others...) -> new Gt {}, @, others...
-    ge: (others...) -> new Ge {}, @, others...
+    eq: varar(1, null, (others...) -> new Eq {}, @, others...)
+    ne: varar(1, null, (others...) -> new Ne {}, @, others...)
+    lt: varar(1, null, (others...) -> new Lt {}, @, others...)
+    le: varar(1, null, (others...) -> new Le {}, @, others...)
+    gt: varar(1, null, (others...) -> new Gt {}, @, others...)
+    ge: varar(1, null, (others...) -> new Ge {}, @, others...)
 
-    not: -> new Not {}, @
+    not: ar () -> new Not {}, @
 
-    add: (others...) -> new Add {}, @, others...
-    sub: (others...) -> new Sub {}, @, others...
-    mul: (others...) -> new Mul {}, @, others...
-    div: (others...) -> new Div {}, @, others...
-    mod: (other) -> new Mod {}, @, other
+    add: varar(1, null, (others...) -> new Add {}, @, others...)
+    sub: varar(1, null, (others...) -> new Sub {}, @, others...)
+    mul: varar(1, null, (others...) -> new Mul {}, @, others...)
+    div: varar(1, null, (others...) -> new Div {}, @, others...)
+    mod: ar (other) -> new Mod {}, @, other
 
     append: ar (val) -> new Append {}, @, val
+    prepend: ar (val) -> new Prepend {}, @, val
+    difference: ar (val) -> new Difference {}, @, val
+    setInsert: ar (val) -> new SetInsert {}, @, val
+    setUnion: ar (val) -> new SetUnion {}, @, val
+    setIntersection: ar (val) -> new SetIntersection {}, @, val
+    setDifference: ar (val) -> new SetDifference {}, @, val
     slice: ar (left, right) -> new Slice {}, @, left, right
     skip: ar (index) -> new Skip {}, @, index
     limit: ar (index) -> new Limit {}, @, index
     getAttr: ar (field) -> new GetAttr {}, @, field
-    contains: (fields...) -> new Contains {}, @, fields...
+    contains: varar(1, null, (fields...) -> new Contains {}, @, fields...)
+    insertAt: ar (index, value) -> new InsertAt {}, @, index, value
+    spliceAt: ar (index, value) -> new SpliceAt {}, @, index, value
+    deleteAt: varar(1, 2, (others...) -> new DeleteAt {}, @, others...)
+    changeAt: ar (index, value) -> new ChangeAt {}, @, index, value
+    indexesOf: ar (which) -> new IndexesOf {}, @, funcWrap(which)
+    hasFields: varar(0, null, (fields...) -> new HasFields {}, @, fields...)
+    withFields: varar(0, null, (fields...) -> new WithFields {}, @, fields...)
+    keys: ar(-> new Keys {}, @)
+
+    # pluck and without on zero fields are allowed
     pluck: (fields...) -> new Pluck {}, @, fields...
     without: (fields...) -> new Without {}, @, fields...
+
     merge: ar (other) -> new Merge {}, @, other
     between: aropt (left, right, opts) -> new Between opts, @, left, right
     reduce: aropt (func, base) -> new Reduce {base:base}, @, funcWrap(func)
     map: ar (func) -> new Map {}, @, funcWrap(func)
-    filter: ar (predicate) -> new Filter {}, @, funcWrap(predicate)
+    filter: aropt (predicate, opts) -> new Filter opts, @, funcWrap(predicate)
     concatMap: ar (func) -> new ConcatMap {}, @, funcWrap(func)
-    orderBy: (fields...) -> new OrderBy {}, @, fields...
+    orderBy: varar(1, null, (fields...) -> new OrderBy {}, @, fields...)
     distinct: ar () -> new Distinct {}, @
-    count: ar () -> new Count {}, @
-    union: (others...) -> new Union {}, @, others...
+    count: varar(0, 1, (fun...) -> new Count {}, @, fun...)
+    union: varar(1, null, (others...) -> new Union {}, @, others...)
     nth: ar (index) -> new Nth {}, @, index
+    match: ar (pattern) -> new Match {}, @, pattern
+    isEmpty: ar () -> new IsEmpty {}, @
     groupedMapReduce: aropt (group, map, reduce, base) -> new GroupedMapReduce {base:base}, @, funcWrap(group), funcWrap(map), funcWrap(reduce)
     innerJoin: ar (other, predicate) -> new InnerJoin {}, @, other, predicate
     outerJoin: ar (other, predicate) -> new OuterJoin {}, @, other, predicate
@@ -71,22 +113,24 @@ class RDBVal extends TermBase
     coerceTo: ar (type) -> new CoerceTo {}, @, type
     typeOf: ar () -> new TypeOf {}, @
     update: aropt (func, opts) -> new Update opts, @, funcWrap(func)
-    delete: ar () -> new Delete {}, @
+    delete: aropt (opts) -> new Delete opts, @
     replace: aropt (func, opts) -> new Replace opts, @, funcWrap(func)
     do: ar (func) -> new FunCall {}, funcWrap(func), @
+    default: ar (x) -> new Default {}, @, x
 
-    or: (others...) -> new Any {}, @, others...
-    and: (others...) -> new All {}, @, others...
+    or: varar(1, null, (others...) -> new Any {}, @, others...)
+    and: varar(1, null, (others...) -> new All {}, @, others...)
 
     forEach: ar (func) -> new ForEach {}, @, funcWrap(func)
 
-    groupBy: (attrs..., collector = null) ->
-        arg_count = attrs.length + (if collector? then 1 else 0)
-        if collector == null
-            throw new RqlDriverError "Expected at least 2 argument(s) but found #{arg_count}."
+    groupBy: (attrs..., collector) ->
+        unless collector? and attrs.length >= 1
+            numArgs = attrs.length + (if collector? then 1 else 0)
+            throw new RqlDriverError "Expected 2 or more argument(s) but found #{numArgs}."
         new GroupBy {}, @, attrs, collector
 
     info: ar () -> new Info {}, @
+    sample: ar (count) -> new Sample {}, @, count
 
 class DatumTerm extends RDBVal
     args: []
@@ -120,7 +164,7 @@ class DatumTerm extends RDBVal
                     datum.setType Datum.DatumType.R_STR
                     datum.setRStr @data
                 else
-                    throw new RqlDriverError "Unknown datum value `#{@data}`, did you forget a `return`?"
+                    throw new RqlDriverError "Cannot convert `#{@data}` to Datum."
         term = new Term
         term.setType Term.TermType.DATUM
         term.setDatum datum
@@ -153,7 +197,6 @@ translateOptargs = (optargs) ->
             when 'useOutdated' then 'use_outdated'
             when 'nonAtomic' then 'non_atomic'
             when 'cacheSize' then 'cache_size'
-            when 'hardDurability' then 'hard_durability'
             else key
 
         if key is undefined or val is undefined then continue
@@ -163,7 +206,12 @@ translateOptargs = (optargs) ->
 class RDBOp extends RDBVal
     constructor: (optargs, args...) ->
         self = super()
-        self.args = (rethinkdb.expr arg for arg in args)
+        self.args =
+            for arg,i in args
+                if arg isnt undefined
+                    rethinkdb.expr arg
+                else
+                    throw new RqlDriverError "Argument #{i} to #{@st || @mt} may not be `undefined`."
         self.optargs = translateOptargs(optargs)
         return self
 
@@ -212,10 +260,13 @@ shouldWrap = (arg) ->
 
 class MakeArray extends RDBOp
     tt: Term.TermType.MAKE_ARRAY
+    st: '[...]' # This is only used by the `undefined` argument checker
+
     compose: (args) -> ['[', intsp(args), ']']
 
 class MakeObject extends RDBOp
     tt: Term.TermType.MAKE_OBJ
+    st: '{...}' # This is only used by the `undefined` argument checker
 
     constructor: (obj) ->
         self = super({})
@@ -256,15 +307,17 @@ class Db extends RDBOp
 
 class Table extends RDBOp
     tt: Term.TermType.TABLE
+    st: 'table'
 
     get: ar (key) -> new Get {}, @, key
     getAll: aropt (key, opts) -> new GetAll opts, @, key
     insert: aropt (doc, opts) -> new Insert opts, @, doc
-    indexCreate: (name, defun) ->
+    indexCreate: varar(1, 2, (name, defun) ->
         if defun?
             new IndexCreate {}, @, name, funcWrap(defun)
         else
             new IndexCreate {}, @, name
+        )
     indexDrop: ar (name) -> new IndexDrop {}, @, name
     indexList: ar () -> new IndexList {}, @
 
@@ -334,6 +387,30 @@ class Append extends RDBOp
     tt: Term.TermType.APPEND
     mt: 'append'
 
+class Prepend extends RDBOp
+    tt: Term.TermType.PREPEND
+    mt: 'prepend'
+
+class Difference extends RDBOp
+    tt: Term.TermType.DIFFERENCE
+    mt: 'difference'
+
+class SetInsert extends RDBOp
+    tt: Term.TermType.SET_INSERT
+    mt: 'setInsert'
+
+class SetUnion extends RDBOp
+    tt: Term.TermType.SET_UNION
+    mt: 'setUnion'
+
+class SetIntersection extends RDBOp
+    tt: Term.TermType.SET_INTERSECTION
+    mt: 'setIntersection'
+
+class SetDifference extends RDBOp
+    tt: Term.TermType.SET_DIFFERENCE
+    mt: 'setDifference'
+
 class Slice extends RDBOp
     tt: Term.TermType.SLICE
     st: 'slice'
@@ -348,15 +425,53 @@ class Limit extends RDBOp
 
 class GetAttr extends RDBOp
     tt: Term.TermType.GETATTR
+    st: '(...)' # This is only used by the `undefined` argument checker
+
     compose: (args) -> [args[0], '(', args[1], ')']
 
 class Contains extends RDBOp
     tt: Term.TermType.CONTAINS
     mt: 'contains'
 
+class InsertAt extends RDBOp
+    tt: Term.TermType.INSERT_AT
+    mt: 'insertAt'
+
+class SpliceAt extends RDBOp
+    tt: Term.TermType.SPLICE_AT
+    mt: 'spliceAt'
+
+class DeleteAt extends RDBOp
+    tt: Term.TermType.DELETE_AT
+    mt: 'deleteAt'
+
+class ChangeAt extends RDBOp
+    tt: Term.TermType.CHANGE_AT
+    mt: 'changeAt'
+
+class Contains extends RDBOp
+    tt: Term.TermType.CONTAINS
+    mt: 'contains'
+
+class HasFields extends RDBOp
+    tt: Term.TermType.HAS_FIELDS
+    mt: 'hasFields'
+
+class WithFields extends RDBOp
+    tt: Term.TermType.WITH_FIELDS
+    mt: 'withFields'
+
+class Keys extends RDBOp
+    tt: Term.TermType.KEYS
+    mt: 'keys'
+
 class Pluck extends RDBOp
     tt: Term.TermType.PLUCK
     mt: 'pluck'
+
+class IndexesOf extends RDBOp
+    tt: Term.TermType.INDEXES_OF
+    mt: 'indexesOf'
 
 class Without extends RDBOp
     tt: Term.TermType.WITHOUT
@@ -406,6 +521,14 @@ class Nth extends RDBOp
     tt: Term.TermType.NTH
     mt: 'nth'
 
+class Match extends RDBOp
+    tt: Term.TermType.MATCH
+    mt: 'match'
+
+class IsEmpty extends RDBOp
+    tt: Term.TermType.IS_EMPTY
+    mt: 'isEmpty'
+
 class GroupedMapReduce extends RDBOp
     tt: Term.TermType.GROUPED_MAP_REDUCE
     mt: 'groupedMapReduce'
@@ -445,6 +568,10 @@ class TypeOf extends RDBOp
 class Info extends RDBOp
     tt: Term.TermType.INFO
     mt: 'info'
+
+class Sample extends RDBOp
+    tt: Term.TermType.SAMPLE
+    mt: 'sample'
 
 class Update extends RDBOp
     tt: Term.TermType.UPDATE
@@ -500,6 +627,8 @@ class IndexList extends RDBOp
 
 class FunCall extends RDBOp
     tt: Term.TermType.FUNCALL
+    st: 'do' # This is only used by the `undefined` argument checker
+
     compose: (args) ->
         if args.length > 2
             ['r.do(', intsp(args[1..]), ', ', args[0], ')']
@@ -507,6 +636,10 @@ class FunCall extends RDBOp
             if shouldWrap(@args[1])
                 args[1] = ['r(', args[1], ')']
             [args[1], '.do(', args[0], ')']
+
+class Default extends RDBOp
+    tt: Term.TermType.DEFAULT
+    mt: 'default'
 
 class Branch extends RDBOp
     tt: Term.TermType.BRANCH
@@ -525,6 +658,11 @@ class ForEach extends RDBOp
     mt: 'forEach'
 
 funcWrap = (val) ->
+    if val is undefined
+        # Pass through the undefined value so it's caught by
+        # the appropriate undefined checker
+        return val
+
     val = rethinkdb.expr(val)
 
     ivarScan = (node) ->
@@ -555,6 +693,9 @@ class Func extends RDBOp
             i++
 
         body = func(args...)
+        if body is undefined
+            throw new RqlDriverError "Annonymous function returned `undefined`. Did you forget a `return`?"
+
         argsArr = new MakeArray({}, argNums...)
         return super(optargs, argsArr, body)
 

@@ -4,12 +4,17 @@
 # It is used for portable builds on platforms where these dependencies are not available or are too old.
 
 V8_DEP :=
+PROTOBUF_DEP :=
 NPM_DEP :=
 TCMALLOC_DEP :=
 PROTOC_DEP :=
+COFFEE_DEP :=
 
-# TODO: use curl if wget not available
-GETURL := wget --quiet --output-document=-
+ifdef WGET
+  GETURL := $(WGET) --quiet --output-document=-
+else ifdef CURL
+  GETURL := $(CURL) --silent
+endif
 
 ifneq (1,$(FETCH_INTERNAL_TOOLS))
   GETURL = bash -c 'echo "Error: Refusing to download $$0 (needed to build $@)" >&2; echo Run ./configure with --allow-fetch to enable downloads. >&2; false'
@@ -49,10 +54,6 @@ V8_SRC_DIR := $(TC_SRC_DIR)/v8
 V8_INT_DIR := $(TC_BUILD_DIR)/v8
 V8_INT_LIB := $(V8_INT_DIR)/libv8.a
 
-.PHONY: support
-support: $(foreach v,$(shell echo $(FETCH_LIST) | tr a-z A-Z), \
-            $(patsubst %,$($(v)),$(filter-out undefined,$(origin $(v)))))
-
 $(shell mkdir -p $(SUPPORT_DIR) $(TOOLCHAIN_DIR) $(TC_BUILD_DIR) $(TC_SRC_DIR))
 
 ifeq (0,$(VERBOSE))
@@ -67,18 +68,20 @@ ifeq ($(PROTOC),$(TC_PROTOC_INT_EXE))
   LD_LIBRARY_PATH ?=
   PROTOC_DEP := $(TC_PROTOC_INT_EXE)
   PROTOC_RUN := env LD_LIBRARY_PATH=$(TC_PROTOC_INT_LIB_DIR):$(LD_LIBRARY_PATH) PATH=$(TC_PROTOC_INT_BIN_DIR):$(PATH) $(PROTOC)
-  TC_PROTOC_CFLAGS := -isystem $(TC_PROTOC_INT_INC_DIR)
-  CXXPATHDS += $(TC_PROTOC_CFLAGS)
-  CPATHDS += $(TC_PROTOC_CFLAGS)
+  CXXFLAGS += -isystem $(TC_PROTOC_INT_INC_DIR)
 else
   PROTOC_RUN := $(PROTOC)
 endif
 
-ifneq (,$(filter $(V8_INT_LIB),$(LIBRARY_PATHS)))
+ifeq ($(V8_INT_LIB),$(V8_LIBS))
   V8_DEP := $(V8_INT_LIB)
   CXXPATHDS += -isystem $(V8_INT_DIR)/include
 else
   V8_CXXFLAGS :=
+endif
+
+ifeq ($(PROTOBUF_INT_LIB),$(PROTOBUF_LIBS))
+  PROTOBUF_DEP := $(PROTOBUF_INT_LIB)
 endif
 
 NPM ?= NO_NPM
@@ -86,9 +89,18 @@ ifeq ($(NPM),$(TC_NPM_INT_EXE))
   NPM_DEP := $(NPM)
 endif
 
-ifneq (,$(filter $(TCMALLOC_MINIMAL_INT_LIB),$(LIBRARY_PATHS)))
+COFFEE ?= NO_COFFEE
+ifeq ($(COFFEE),$(TC_COFFEE_INT_EXE))
+  COFFEE_DEP := $(COFFEE)
+endif
+
+ifeq ($(TCMALLOC_MINIMAL_INT_LIB),$(TCMALLOC_MINIMAL_LIBS))
   TCMALLOC_DEP := $(TCMALLOC_MINIMAL_INT_LIB)
 endif
+
+.PHONY: support
+support: $(COFFEE_DEP) $(V8_DEP) $(PROTOBUF_DEP) $(NPM_DEP) $(TCMALLOC_DEP) $(PROTOC_DEP)
+support: $(LESSC) $(HANDLEBARS)
 
 $(TC_BUILD_DIR)/%: $(TC_SRC_DIR)/%
 	$P CP
@@ -101,9 +113,9 @@ $(TC_LESSC_INT_EXE): $(NODE_MODULES_DIR)/less | $(dir $(TC_LESSC_INT_EXE)).
 	ln -s $(abspath $</bin/lessc) $@
 	touch $@
 
-$(NODE_MODULES_DIR)/less: $(NPM_DEP)
+$(NODE_MODULES_DIR)/less: $(NPM_DEP) | $(NODE_MODULES_DIR)/.
 	$P NPM-I less
-	cd $(TOOLCHAIN_DIR) && $(abspath $(NPM)) install less $(SUPPORT_LOG_REDIRECT)
+	cd $(TOOLCHAIN_DIR) && $(abspath $(NPM)) install less@1.3.3 $(SUPPORT_LOG_REDIRECT)
 
 $(TC_COFFEE_INT_EXE): $(NODE_MODULES_DIR)/coffee-script | $(dir $(TC_COFFEE_INT_EXE)).
 	$P LN
@@ -111,10 +123,10 @@ $(TC_COFFEE_INT_EXE): $(NODE_MODULES_DIR)/coffee-script | $(dir $(TC_COFFEE_INT_
 	ln -s $(abspath $</bin/coffee) $@
 	touch $@
 
-$(NODE_MODULES_DIR)/coffee-script: $(NPM_DEP)
+$(NODE_MODULES_DIR)/coffee-script: $(NPM_DEP) | $(NODE_MODULES_DIR)/.
 	$P NPM-I coffee-script
 	cd $(TOOLCHAIN_DIR) && \
-	  $(abspath $(NPM)) install https://github.com/jashkenas/coffee-script/archive/1.6.2.tar.gz $(SUPPORT_LOG_REDIRECT)
+	  $(abspath $(NPM)) install coffee-script@1.4.0 $(SUPPORT_LOG_REDIRECT)
 
 $(TC_HANDLEBARS_INT_EXE): $(NODE_MODULES_DIR)/handlebars | $(dir $(TC_HANDLEBARS_INT_EXE)).
 	$P LN
@@ -122,10 +134,10 @@ $(TC_HANDLEBARS_INT_EXE): $(NODE_MODULES_DIR)/handlebars | $(dir $(TC_HANDLEBARS
 	ln -s $(abspath $</bin/handlebars) $@
 	touch $@
 
-$(NODE_MODULES_DIR)/handlebars: $(NPM_DEP)
+$(NODE_MODULES_DIR)/handlebars: $(NPM_DEP) | $(NODE_MODULES_DIR)/.
 	$P NPM-I handlebars
 	cd $(TOOLCHAIN_DIR) && \
-	  $(abspath $(NPM)) install handlebars $(SUPPORT_LOG_REDIRECT)
+	  $(abspath $(NPM)) install handlebars@1.0.7 $(SUPPORT_LOG_REDIRECT)
 
 $(V8_SRC_DIR):
 	$P SVN-CO v8
@@ -159,16 +171,23 @@ $(TC_NODE_INT_EXE): $(NODE_DIR)
 
 $(PROTOC_SRC_DIR):
 	$P DOWNLOAD protoc
-	$(GETURL) http://protobuf.googlecode.com/files/protobuf-2.4.1.tar.bz2 | ( \
+	$(GETURL) http://protobuf.googlecode.com/files/protobuf-2.5.0.tar.bz2 | ( \
 	  cd $(TC_SRC_DIR) && \
 	  tar -xjf - && \
 	  rm -rf protobuf && \
-	  mv protobuf-2.4.1 protobuf )
+	  mv protobuf-2.5.0 protobuf )
+
+ifeq ($(COMPILER) $(OS),CLANG Darwin)
+  BUILD_PROTOC_ENV := CXX=clang++ CXXFLAGS='-std=c++11 -stdlib=libc++' LDFLAGS=-lc++
+else
+  BUILD_PROTOC_ENV :=
+endif
 
 $(PROTOBUF_INT_LIB): $(TC_PROTOC_INT_EXE)
 $(TC_PROTOC_INT_EXE): $(PROTOC_DIR)
 	$P MAKE protoc
 	( cd $(PROTOC_DIR) && \
+	  $(BUILD_PROTOC_ENV) \
 	  ./configure --prefix=$(SUPPORT_DIR_ABS)/usr && \
 	  $(EXTERN_MAKE) PREFIX=$(SUPPORT_DIR_ABS)/usr prefix=$(SUPPORT_DIR_ABS)/usr DESTDIR=/ && \
 	  $(EXTERN_MAKE) install PREFIX=$(SUPPORT_DIR_ABS)/usr prefix=$(SUPPORT_DIR_ABS)/usr DESTDIR=/ ) \

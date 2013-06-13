@@ -611,16 +611,16 @@ module 'DataExplorerView', ->
                                 return true
                     return true
 
+                if event.type isnt 'keypress' # We catch keypress because single and double quotes have not the same keyCode on keydown/keypres #thisIsMadness
+                    return true
+
                 char_to_insert = String.fromCharCode event.which
-                if char_to_insert? and event.which isnt 91 # 91 map to [ on OS X
+                if char_to_insert? # and event.which isnt 91 # 91 map to [ on OS X
                     if @codemirror.getSelection() isnt ''
                         if (char_to_insert of @matching_opening_bracket or char_to_insert of @matching_closing_bracket)
                             @codemirror.replaceSelection ''
                         else
                             return true
-                    if event.type isnt 'keypress' # We catch keypress because single and double quotes have not the same keyCode on keydown/keypres #thisIsMadness
-                        return true
-
                     last_element_incomplete_type = @last_element_type_if_incomplete(stack)
                     if char_to_insert is '"' or char_to_insert is "'"
                         num_quote = @count_char char_to_insert
@@ -1109,11 +1109,11 @@ module 'DataExplorerView', ->
             # We are scrolling in history
             if @history_displayed_id isnt 0 and event?
                 # We catch ctrl, shift, alt and command 
-                if event.ctrlKey or event.shiftKey or event.altKey or event.which is 16 or event.which is 17 or event.which is 18 or event.which is 20 or event.which is 91 or event.which is 92 or event.type of @mouse_type_event
+                if event.ctrlKey or event.shiftKey or event.altKey or event.which is 16 or event.which is 17 or event.which is 18 or event.which is 20 or (event.which is 91 and event.type isnt 'keypress') or event.which is 92 or event.type of @mouse_type_event
                     return false
 
             # We catch ctrl, shift, alt and command but don't look for active key (active key here refer to ctrl, shift, alt being pressed and hold)
-            if event? and (event.which is 16 or event.which is 17 or event.which is 18 or event.which is 20 or event.which is 91 or event.which is 92)
+            if event? and (event.which is 16 or event.which is 17 or event.which is 18 or event.which is 20 or (event.which is 91 and event.type isnt 'keypress') or event.which is 92)
                 return false
 
 
@@ -2287,8 +2287,6 @@ module 'DataExplorerView', ->
         execute_portion: =>
             @saved_data.cursor = null
             while @queries[@index]?
-                @driver_handler.reset_count()
-
                 full_query = @non_rethinkdb_query
                 full_query += @queries[@index]
 
@@ -2759,8 +2757,13 @@ module 'DataExplorerView', ->
                     return @template_json_tree.array
                         values: sub_values
             else if value_type is 'object'
-                sub_values = []
+                sub_keys = []
                 for key of value
+                    sub_keys.push key
+                sub_keys.sort()
+
+                sub_values = []
+                for key in sub_keys
                     last_key = key
                     sub_values.push
                         key: key
@@ -2839,8 +2842,8 @@ module 'DataExplorerView', ->
 
         # Sort the keys per level
         order_keys: (keys) =>
+            copy_keys = []
             if keys.object?
-                copy_keys = []
                 for key, value of keys.object
                     if jQuery.isPlainObject(value)
                         @order_keys value
@@ -2857,14 +2860,16 @@ module 'DataExplorerView', ->
                             return 1
                         else # We cannot have two times the same key
                             return -1
-                keys.sorted_keys = _.map copy_keys, (d) -> return d.key
-                if keys.primitive_value_count > 0
-                    keys.sorted_keys.unshift @primitive_key
+            keys.sorted_keys = _.map copy_keys, (d) -> return d.key
+            if keys.primitive_value_count > 0
+                keys.sorted_keys.unshift @primitive_key
 
         # Build the table
         # We order by the most frequent keys then by alphabetic order
         json_to_table: (result) =>
-            if not (result.constructor? and result.constructor is Array)
+            # While an Array type is never returned by the driver, we still build an Array in the data explorer
+            # when a cursor is returned (since we just print @limit results)
+            if not result.constructor? or (result.constructor isnt ArrayResult and result.constructor isnt Array)
                 result = [result]
 
             keys_count =
@@ -2953,7 +2958,6 @@ module 'DataExplorerView', ->
                             value = value[key]
                         else
                             value = undefined
-
                     new_document.cells.push @json_to_table_get_td_value value, col
                 new_document.record = @container.saved_data.start_record + i
                 document_list.push new_document
@@ -2979,7 +2983,7 @@ module 'DataExplorerView', ->
             else if value is undefined
                 data['value'] = 'undefined'
                 data['classname'] = 'jta_undefined'
-            else if value.constructor? and value.constructor is Array
+            else if value.constructor? and value.constructor is ArrayResult
                 if value.length is 0
                     data['value'] = '[ ]'
                     data['classname'] = 'empty array'
@@ -3000,6 +3004,7 @@ module 'DataExplorerView', ->
                     data['classname'] = 'jta_string'
             else if value_type is 'boolean'
                 data['classname'] = 'jta_bool'
+                data.value = if value is true then 'true' else 'false'
 
             return data
 
@@ -3409,13 +3414,14 @@ module 'DataExplorerView', ->
                 is_at_bottom: 'true'
 
     class @DriverHandler
+        query_error_template: Handlebars.templates['dataexplorer-query_error-template']
+
         # I don't want that thing in window
         constructor: (args) ->
-            that = @
-
             @container = args.container
             @on_success = args.on_success
             @on_fail = args.on_fail
+            @dont_timeout_connection = if args.dont_timeout_connection? then args.dont_timeout_connection else false
 
             if window.location.port is ''
                 if window.location.protocol is 'https:'
@@ -3432,23 +3438,20 @@ module 'DataExplorerView', ->
             @hack_driver()
             @connect()
         
-        reset_count: =>
-            @count = 0
-            @done = 0
-
         # Hack the driver, remove .run() and private_run()
         hack_driver: =>
             if not TermBase.prototype.private_run?
                 that = @
                 TermBase.prototype.private_run = TermBase.prototype.run
                 TermBase.prototype.run = ->
-                    throw that.container.query_error_template
+                    throw that.query_error_template
                         found_run: true
 
         connect: =>
             that = @
             # Whether we are going to reconnect or not, the cursor might have timed out.
-            @container.saved_data.cursor_timed_out = true
+            if @container?
+                @container.saved_data.cursor_timed_out = true
             if @timeout?
                 clearTimeout @timeout
 
@@ -3465,8 +3468,10 @@ module 'DataExplorerView', ->
                     else
                         that.connection = connection
                         that.on_success(connection)
-                @container.results_view.cursor_timed_out()
-                @timeout = setTimeout @connect, 5*60*1000
+                if @container?
+                    @container.results_view.cursor_timed_out()
+                unless @dont_timeout_connection
+                    @timeout = setTimeout @connect, 5*60*1000
             catch err
                 @on_fail()
     

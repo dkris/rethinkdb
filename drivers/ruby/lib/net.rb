@@ -75,17 +75,26 @@ module RethinkDB
   end
 
   class Connection
+    def auto_reconnect(x=true)
+      @auto_reconnect = x
+      self
+    end
     def repl; RQL.set_default_conn self; end
 
-    def initialize(host='localhost', port=28015, default_db=nil)
+    def initialize(opts={})
       begin
         @abort_module = ::IRB
       rescue NameError => e
         @abort_module = Faux_Abort
       end
+
+      opts = {:host => opts} if opts.class == String
+      @host = opts[:host] || "localhost"
+      @port = opts[:port] || 28015
+      default_db = opts[:db]
+      @auth_key = opts[:auth_key] || ""
+
       @@last = self
-      @host = host
-      @port = port
       @default_opts = default_db ? {:db => RQL.new.db(default_db)} : {}
       @conn_id = 0
       reconnect
@@ -93,25 +102,35 @@ module RethinkDB
     attr_reader :default_db, :conn_id
 
     @@token_cnt = 0
-    def run_internal q
+    def run_internal(q, noreply=false)
       dispatch q
-      wait q.token
+      noreply ? nil : wait(q.token)
     end
     def run(msg, opts)
+      reconnect if @auto_reconnect && (!@socket || !@listener)
       raise RuntimeError, "Error: Connection Closed." if !@socket || !@listener
       q = Query.new
       q.type = Query::QueryType::START
       q.query = msg
       q.token = @@token_cnt += 1
 
-      @default_opts.merge(opts).each {|k,v|
+      all_opts = @default_opts.merge(opts)
+      if all_opts.keys.include?(:noreply)
+        all_opts[:noreply] = !!all_opts[:noreply]
+      end
+      all_opts.each {|k,v|
         ap = Query::AssocPair.new
         ap.key = k.to_s
-        ap.val = v.to_pb
+        if v.class == RQL
+          ap.val = v.to_pb
+        else
+          ap.val = RQL.new.expr(v).to_pb
+        end
         q.global_optargs << ap
       }
 
-      res = run_internal q
+      res = run_internal(q, all_opts[:noreply])
+      return res if !res
       if res.type == Response::ResponseType::SUCCESS_PARTIAL
         Cursor.new(Shim.response_to_native(res, msg), msg, self, q.token, true)
       elsif res.type == Response::ResponseType::SUCCESS_SEQUENCE
@@ -122,13 +141,13 @@ module RethinkDB
     end
 
     def send packet
-      @socket.send(packet, 0)
+      @socket.write(packet)
     end
 
     def dispatch msg
-      PP.pp msg if $DEBUG
+      # PP.pp msg if $DEBUG
       payload = msg.serialize_to_string
-      #File.open('sexp_payloads.txt', 'a') {|f| f.write(payload.inspect+"\n")}
+      # File.open('sexp_payloads.txt', 'a') {|f| f.write(payload.inspect+"\n")}
       send([payload.length].pack('L<') + payload)
       return msg.token
     end
@@ -163,7 +182,7 @@ module RethinkDB
     end
 
     @@last = nil
-    @@magic_number = 0x3f61ba36
+    @@magic_number = VersionDummy::Version::V0_2
 
     def debug_socket; @socket; end
 
@@ -202,7 +221,18 @@ module RethinkDB
           return buf
         end
       end
-      @socket.send([@@magic_number].pack('L<'), 0)
+      @socket.write([@@magic_number].pack('L<'))
+
+      @socket.write([@auth_key.size].pack('L<') + @auth_key)
+      response = ""
+      while response[-1..-1] != "\0"
+        response += @socket.read_exn(1)
+      end
+      response = response[0...-1]
+      if response != "SUCCESS"
+        raise RqlRuntimeError,"Server dropped connection with message: \"#{response}\""
+      end
+
       @listener.terminate if @listener
       @listener = Thread.new do
         loop do

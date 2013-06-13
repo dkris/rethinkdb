@@ -24,6 +24,7 @@ COFFEE_SOURCES := $(patsubst %, $(WEB_SOURCE_DIR)/static/coffee/%,\
 			navbar.coffee \
 			router.coffee \
 			app.coffee)
+COFFEE_VERSION_FILE :=  $(WEB_ASSETS_OBJ_DIR)/version.coffee
 LESS_SOURCES := $(shell find $(WEB_SOURCE_DIR)/static/less -name '*.less')
 LESS_MAIN := $(WEB_SOURCE_DIR)/static/less/styles.less
 CLUSTER_HTML := $(WEB_SOURCE_DIR)/templates/cluster.html
@@ -40,15 +41,19 @@ $(TOP)/admin/all: web-assets
 .PHONY: web-assets
 web-assets: $(BUILD_WEB_ASSETS) | $(BUILD_DIR)/.
 
+.PRECIOUS: $(WEB_ASSETS_BUILD_DIR)/.
+
 ifeq (1,$(USE_PRECOMPILED_WEB_ASSETS))
 
 $(WEB_ASSETS_BUILD_DIR)/%: $(PRECOMPILED_DIR)/web/% | $(WEB_ASSETS_BUILD_DIR)/.
 	$P CP
 	mkdir -p $(dir $@)
-	cp -pRP $< $@
+	cp -pRP $< $(dir $@)
 
 $(PRECOMPILED_DIR)/web/%:
-	$(error Missing file $@. Run ./configure with --disable-precompiled-web to build normally.)
+	test -e $@ || ( \
+	  echo 'Missing file $@. Run ./configure with --disable-precompiled-web to build normally.' ; \
+	  false )
 
 else # Don't use precompiled assets
 
@@ -60,7 +65,10 @@ $(WEB_ASSETS_BUILD_DIR)/js/template.js: $(HANDLEBAR_HTML_FILES) $(HANDLEBARS) $(
 	$P HANDLEBARS $@
 	env TC_HANDLEBARS_EXE=$(HANDLEBARS) $(TOP)/scripts/build_handlebars_templates.py $(WEB_SOURCE_DIR)/static/handlebars $(BUILD_DIR) $(WEB_ASSETS_BUILD_DIR)/js
 
-$(WEB_ASSETS_OBJ_DIR)/cluster-min.concat.coffee: $(COFFEE_SOURCES) | $(WEB_ASSETS_OBJ_DIR)/.
+$(COFFEE_VERSION_FILE): | $(WEB_ASSETS_OBJ_DIR)/.
+	echo "window.VERSION = '$(RETHINKDB_VERSION)'" > $@
+
+$(WEB_ASSETS_OBJ_DIR)/cluster-min.concat.coffee: $(COFFEE_VERSION_FILE) $(COFFEE_SOURCES) | $(WEB_ASSETS_OBJ_DIR)/.
 	$P CONCAT $@
 	cat $+ > $@
 

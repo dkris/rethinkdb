@@ -31,12 +31,15 @@ public:
 
     struct context_t {
         context_t() : interruptor(0) { }
-        static const int32_t magic_number = VersionDummy::V0_1;
+        static const int32_t no_auth_magic_number = VersionDummy::V0_1;
+        static const int32_t auth_magic_number = VersionDummy::V0_2;
         ql::stream_cache2_t stream_cache2;
         signal_t *interruptor;
     };
 private:
-    Response handle(ql::protob_t<Query> q, context_t *query2_context);
+    MUST_USE bool handle(ql::protob_t<Query> q,
+                         Response *response_out,
+                         context_t *query2_context);
     protob_server_t<ql::protob_t<Query>, Response, context_t> server;
     rdb_protocol_t::context_t *ctx;
     uuid_u parser_id;

@@ -634,15 +634,16 @@ namespace {
 
 struct receive_backfill_visitor_t : public boost::static_visitor<> {
     receive_backfill_visitor_t(btree_slice_t *_btree, transaction_t *_txn,
-                               superblock_t *_superblock, UNUSED signal_t *_interruptor)
-        : btree(_btree), txn(_txn), superblock(_superblock) { }
+                               superblock_t *_superblock, signal_t *_interruptor)
+        : btree(_btree), txn(_txn),
+          superblock(_superblock), interruptor(_interruptor) { }
 
     void operator()(const backfill_chunk_t::delete_key_t& delete_key) const {
         memcached_delete(delete_key.key, true, btree, 0, delete_key.recency, txn, superblock);
     }
     void operator()(const backfill_chunk_t::delete_range_t& delete_range) const {
         hash_range_key_tester_t tester(delete_range.range);
-        memcached_erase_range(btree, &tester, delete_range.range.inner, txn, superblock);
+        memcached_erase_range(btree, &tester, delete_range.range.inner, txn, superblock, interruptor);
     }
     void operator()(const backfill_chunk_t::key_value_pair_t& kv) const {
         const backfill_atom_t& bf_atom = kv.backfill_atom;
@@ -669,9 +670,7 @@ private:
     btree_slice_t *btree;
     transaction_t *txn;
     superblock_t *superblock;
-
-    // FIXME: interruptors are not used in btree code, so this one ignored.
-    // signal_t *interruptor;
+    signal_t *interruptor;
 };
 
 }   /* anonymous namespace */
@@ -679,9 +678,10 @@ private:
 void store_t::protocol_receive_backfill(btree_slice_t *btree,
                                         transaction_t *txn,
                                         superblock_t *superblock,
-                                        write_token_pair_t *,
+                                        write_token_pair_t *token_pair,
                                         signal_t *interruptor,
                                         const backfill_chunk_t &chunk) {
+    token_pair->sindex_write_token.reset();
     boost::apply_visitor(receive_backfill_visitor_t(btree, txn, superblock, interruptor), chunk.val);
 }
 
@@ -709,14 +709,17 @@ void store_t::protocol_reset_data(const region_t& subregion,
                                   btree_slice_t *btree,
                                   transaction_t *txn,
                                   superblock_t *superblock,
-                                  write_token_pair_t *) {
+                                  write_token_pair_t *token_pair,
+                                  signal_t *interruptor) {
+    token_pair->sindex_write_token.reset();
+
     hash_key_tester_t key_tester(subregion.beg, subregion.end);
-    memcached_erase_range(btree, &key_tester, subregion.inner, txn, superblock);
+    memcached_erase_range(btree, &key_tester, subregion.inner, txn, superblock, interruptor);
 }
 
 class generic_debug_print_visitor_t : public boost::static_visitor<void> {
 public:
-    explicit generic_debug_print_visitor_t(append_only_printf_buffer_t *buf) : buf_(buf) { }
+    explicit generic_debug_print_visitor_t(printf_buffer_t *buf) : buf_(buf) { }
 
     template <class T>
     void operator()(const T& x) {
@@ -724,13 +727,13 @@ public:
     }
 
 private:
-    append_only_printf_buffer_t *buf_;
+    printf_buffer_t *buf_;
     DISABLE_COPYING(generic_debug_print_visitor_t);
 };
 
 
 // Debug printing impls
-void debug_print(append_only_printf_buffer_t *buf, const write_t& write) {
+void debug_print(printf_buffer_t *buf, const write_t& write) {
     buf->appendf("mcwrite{");
     generic_debug_print_visitor_t v(buf);
     boost::apply_visitor(v, write.mutation);
@@ -744,44 +747,44 @@ void debug_print(append_only_printf_buffer_t *buf, const write_t& write) {
     buf->appendf("}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const get_cas_mutation_t& mut) {
+void debug_print(printf_buffer_t *buf, const get_cas_mutation_t& mut) {
     buf->appendf("get_cas{");
     debug_print(buf, mut.key);
     buf->appendf("}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const sarc_mutation_t& mut) {
+void debug_print(printf_buffer_t *buf, const sarc_mutation_t& mut) {
     buf->appendf("sarc{");
     debug_print(buf, mut.key);
     // We don't print everything in the sarc yet.
     buf->appendf(", ...}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const delete_mutation_t& mut) {
+void debug_print(printf_buffer_t *buf, const delete_mutation_t& mut) {
     buf->appendf("delete{");
     debug_print(buf, mut.key);
     buf->appendf(", dpidq=%s}", mut.dont_put_in_delete_queue ? "true" : "false");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const incr_decr_mutation_t& mut) {
+void debug_print(printf_buffer_t *buf, const incr_decr_mutation_t& mut) {
     buf->appendf("incr_decr{%s, %" PRIu64 ", ", mut.kind == incr_decr_INCR ? "INCR" : mut.kind == incr_decr_DECR ? "DECR" : "???", mut.amount);
     debug_print(buf, mut.key);
     buf->appendf("}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const append_prepend_mutation_t& mut) {
+void debug_print(printf_buffer_t *buf, const append_prepend_mutation_t& mut) {
     buf->appendf("append_prepend{%s, ", mut.kind == append_prepend_APPEND ? "APPEND" : mut.kind == append_prepend_PREPEND ? "PREPEND" : "???");
     debug_print(buf, mut.key);
     // We don't print the data yet.
     buf->appendf(", ...}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const backfill_chunk_t& chunk) {
+void debug_print(printf_buffer_t *buf, const backfill_chunk_t& chunk) {
     generic_debug_print_visitor_t v(buf);
     boost::apply_visitor(v, chunk.val);
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const backfill_chunk_t::delete_key_t& del) {
+void debug_print(printf_buffer_t *buf, const backfill_chunk_t::delete_key_t& del) {
     buf->appendf("bf::delete_key_t{key=");
     debug_print(buf, del.key);
     buf->appendf(", recency=");
@@ -789,13 +792,13 @@ void debug_print(append_only_printf_buffer_t *buf, const backfill_chunk_t::delet
     buf->appendf("}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const backfill_chunk_t::delete_range_t& del) {
+void debug_print(printf_buffer_t *buf, const backfill_chunk_t::delete_range_t& del) {
     buf->appendf("bf::delete_range_t{range=");
     debug_print(buf, del.range);
     buf->appendf("}");
 }
 
-void debug_print(append_only_printf_buffer_t *buf, const backfill_chunk_t::key_value_pair_t& kvpair) {
+void debug_print(printf_buffer_t *buf, const backfill_chunk_t::key_value_pair_t& kvpair) {
     buf->appendf("bf::kv{atom=");
     debug_print(buf, kvpair.backfill_atom);
     buf->appendf("}");

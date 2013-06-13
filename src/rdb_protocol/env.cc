@@ -22,7 +22,7 @@ bool env_t::add_optarg(const std::string &key, const Term &val) {
     if (optargs.count(key)) return true;
     protob_t<Term> arg = make_counted_term();
     N2(FUNC, N0(MAKE_ARRAY), *arg = val);
-    term_walker_t(arg.get(), &val.GetExtension(ql2::extension::backtrace));
+    propagate_backtrace(arg.get(), &val.GetExtension(ql2::extension::backtrace));
     optargs[key] = wire_func_t(*arg, std::map<int64_t, Datum>());
     counted_t<func_t> force_compilation = optargs[key].compile(this);
     r_sanity_check(force_compilation != NULL);
@@ -66,9 +66,9 @@ void env_t::push_implicit(counted_t<const datum_t> *val) {
     implicit_var.push(val);
 }
 counted_t<const datum_t> *env_t::top_implicit(const rcheckable_t *caller) {
-    rcheck_target(caller, !implicit_var.empty(),
+    rcheck_target(caller, base_exc_t::GENERIC, !implicit_var.empty(),
                   "r.row is not defined in this context.");
-    rcheck_target(caller, implicit_var.size() == 1,
+    rcheck_target(caller, base_exc_t::GENERIC, implicit_var.size() == 1,
                   "Cannot use r.row in nested queries.  Use functions instead.");
     return implicit_var.top();
 }
@@ -81,10 +81,38 @@ void env_t::push_var(int var, counted_t<const datum_t> *val) {
     vars[var].push(val);
 }
 
+static counted_t<const datum_t> sindex_error_dummy_datum;
+void env_t::push_special_var(int var, special_var_t special_var) {
+    switch (special_var) {
+    case SINDEX_ERROR_VAR: {
+        vars[var].push(&sindex_error_dummy_datum);
+    } break;
+    default: unreachable();
+    }
+}
+
+env_t::special_var_shadower_t::special_var_shadower_t(
+    env_t *env, special_var_t special_var) : shadow_env(env) {
+    shadow_env->dump_scope(&current_scope);
+    for (auto it = current_scope.begin(); it != current_scope.end(); ++it) {
+        shadow_env->push_special_var(it->first, special_var);
+    }
+}
+
+env_t::special_var_shadower_t::~special_var_shadower_t() {
+    for (auto it = current_scope.begin(); it != current_scope.end(); ++it) {
+        shadow_env->pop_var(it->first);
+    }
+}
+
 counted_t<const datum_t> *env_t::top_var(int var, const rcheckable_t *caller) {
-    rcheck_target(caller, !vars[var].empty(),
+    rcheck_target(caller, base_exc_t::GENERIC, !vars[var].empty(),
                   strprintf("Unrecognized variabled %d", var));
-    return vars[var].top();
+    counted_t<const datum_t> *var_val = vars[var].top();
+    rcheck_target(caller, base_exc_t::GENERIC,
+                  var_val != &sindex_error_dummy_datum,
+                  "Cannot reference external variables from inside an index.");
+    return var_val;
 }
 void env_t::pop_var(int var) {
     vars[var].pop();
@@ -194,7 +222,7 @@ env_t::env_t(
     semilattice_metadata(_semilattice_metadata),
     directory_read_manager(_directory_read_manager),
     js_runner(_js_runner),
-    DEBUG_ONLY(eval_callback(NULL),)
+    DEBUG_ONLY(eval_callback(NULL), )
     interruptor(_interruptor),
     this_machine(_this_machine) {
 
@@ -208,7 +236,7 @@ env_t::env_t(signal_t *_interruptor)
     pool(NULL),
     ns_repo(NULL),
     directory_read_manager(NULL),
-    DEBUG_ONLY(eval_callback(NULL),)
+    DEBUG_ONLY(eval_callback(NULL), )
     interruptor(_interruptor) { }
 
 env_t::~env_t() { }

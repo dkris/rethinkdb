@@ -11,12 +11,13 @@ var r = require('../../../drivers/javascript/build/rethinkdb');
 var build_dir = process.env.BUILD_DIR || '../../../build/debug'
 var testDefault = process.env.TEST_DEFAULT_PORT == "1"
 
-var port = Math.floor(Math.random()*(65535 - 1025)+1025)
+var port = null;
 
 var assertErr = function(err, type, msg) {
     assertNotNull(err);
     assert.equal(err.constructor.name, type);
     var _msg = err.message.replace(/ in:\n([\r\n]|.)*/m, "");
+    _msg = _msg.replace(/\nFailed assertion:(.|\n)*/m, "")
     assert.equal(_msg, msg);
 };
 
@@ -68,19 +69,31 @@ var assertNotNull = function(x){
     assert.notEqual(x, null);
 }
 
+var ifTestDefault = function(f, c){
+    if(testDefault){
+        return f(c);
+    }else{
+        return c();
+    }
+}
+
 describe('Javascript connection API', function(){
     describe('With no server', function(){
         it("fails when trying to connect", function(done){
-            r.connect({}, givesError("RqlDriverError", "Could not connect to localhost:28015.", function(){
-                r.connect({port:11221}, givesError("RqlDriverError", "Could not connect to localhost:11221.", function(){
-                    r.connect({host:'0.0.0.0'}, givesError("RqlDriverError", "Could not connect to 0.0.0.0:28015.", function(){
-                        r.connect({host:'0.0.0.0', port:11221}, givesError("RqlDriverError", "Could not connect to 0.0.0.0:11221.", done))}))}))}));
+            ifTestDefault(
+                function(cont){
+                    console.log('FOO');
+                    r.connect({}, givesError("RqlDriverError", "Could not connect to localhost:28015.", function(){
+                        r.connect({host:'0.0.0.0'}, givesError("RqlDriverError", "Could not connect to 0.0.0.0:28015.", cont))})); },
+                function(){
+                    r.connect({port:11221}, givesError("RqlDriverError", "Could not connect to localhost:11221.", function(){
+                        r.connect({host:'0.0.0.0', port:11221}, givesError("RqlDriverError", "Could not connect to 0.0.0.0:11221.", done))}))});
         });
 
         it("empty run", function(done) {
           assert.throws(function(){ r.expr(1).run(); },
                         checkError("RqlDriverError",
-                                   "First argument to `run` must be an open connection or { connection: <connection>, useOutdated: <bool> }."));
+                                   "First argument to `run` must be an open connection or { connection: <connection>, useOutdated: <bool>, noreply: <bool> }."));
           done();
         });
     });
@@ -89,14 +102,17 @@ describe('Javascript connection API', function(){
 
         var cpp_server;
         var server_out_log;
-        var server_err_log
+        var server_err_log;
+        var cluster_port;
 
         beforeEach(function(done){
+            port = Math.floor(Math.random()*(65535 - 1025)+1025);
+            cluster_port = port + 1;
             server_out_log = fs.openSync('run/server-log.txt', 'a');
             server_err_log = fs.openSync('run/server-error-log.txt', 'a');
             cpp_server = spawn(
                 build_dir + '/rethinkdb',
-                ['--driver-port', port, '--http-port', '0', '--cluster-port', '0'],
+                ['--driver-port', port, '--http-port', '0', '--cluster-port', cluster_port],
                 {stdio: ['ignore', server_out_log, server_err_log]});
             setTimeout(done, 1000);
         });
@@ -107,6 +123,33 @@ describe('Javascript connection API', function(){
             setTimeout(done, 10);
             fs.close(server_out_log);
             fs.close(server_err_log);
+        });
+
+        it("authorization key when none needed", function(done){
+            r.connect({port: port, authKey: "hunter2"}, givesError("RqlDriverError", "Server dropped connection with message: \"ERROR: incorrect authorization key\"", done));
+        });
+
+        it("correct authorization key", function(done){
+            spawn(build_dir + '/rethinkdb',
+                  ['admin', '--join', 'localhost:' + cluster_port, 'set', 'auth', 'hunter2'],
+                  {stdio: ['ignore', server_out_log, server_err_log]});
+
+            setTimeout(function(){
+                r.connect({port: port, authKey: "hunter2"}, function(e, c){
+                    assertNull(e);
+                    r.expr(1).run(c, noError(done));
+                });
+            }, 500);
+        });
+
+        it("wrong authorization key", function(done){
+            spawn(build_dir + '/rethinkdb',
+                  ['admin', '--join', 'localhost:' + cluster_port, 'set', 'auth', 'hunter2'],
+                  {stdio: ['ignore', server_out_log, server_err_log]});
+
+            setTimeout(function(){
+                r.connect({port: port, authKey: "hunter23"}, givesError("RqlDriverError", "Server dropped connection with message: \"ERROR: incorrect authorization key\"", done));
+            }, 500);
         });
 
         // TODO: test default port
@@ -126,9 +169,7 @@ describe('Javascript connection API', function(){
 
         it("fails to query after close", withConnection(function(done, c){
             c.close();
-            assert.throws(function(){ r(1).run(c, function(){}); },
-                          checkError("RqlDriverError", "Connection is closed."));
-            done();
+            r(1).run(c, givesError("RqlDriverError", "Connection is closed.", done));
         }));
 
         it("test use", withConnection(function(done, c){
@@ -151,10 +192,7 @@ describe('Javascript connection API', function(){
         it("fails to query after kill", withConnection(function(done, c){
             cpp_server.kill();
             setTimeout(function() {
-                assert.throws(function(){
-                    r(1).run(c, function(err, res) { assert.ok(false, "This callback should never get called"); });
-                }, checkError("RqlDriverError", "Connection is closed."));
-                done();
+                r(1).run(c, givesError("RqlDriverError", "Connection is closed.", done));
             }, 100);
         }));
 
@@ -178,6 +216,24 @@ describe('Javascript connection API', function(){
             assert.throws(function(){ r.connect(); });
             assert.throws(function(){ c.use(); });
             done();
+        }));
+
+        // Test the event emitter interface
+
+        it("Emits connect event on connect", withConnection(function(done, c){
+            c.on('connect', function(err, c2) {
+                done();
+            });
+
+            c.reconnect(function(){});
+        }));
+
+        it("Emits close event on close", withConnection(function(done, c){
+            c.on('close', function() {
+                done();
+            });
+
+            c.close();
         }));
     });
 });

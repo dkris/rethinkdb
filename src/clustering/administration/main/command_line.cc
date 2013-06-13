@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <libgen.h>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/stat.h>
@@ -52,6 +53,25 @@ void remove_pid_file() {
     }
 }
 
+int check_pid_file(const std::string &pid_filepath) {
+    guarantee(pid_filepath.size() > 0);
+
+    if (access(pid_filepath.c_str(), F_OK) == 0) {
+        logERR("The pid-file specified already exists. This might mean that an instance is already running.");
+        return EXIT_FAILURE;
+    }
+
+    // Make a copy of the filename since `dirname` may modify it
+    char pid_dir[PATH_MAX + 1];
+    strncpy(pid_dir, pid_filepath.c_str(), PATH_MAX + 1);
+    if (access(dirname(pid_dir), W_OK) == -1) {
+        logERR("Cannot access the pid-file directory.");
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
+
 int write_pid_file(const std::string &pid_filepath) {
     guarantee(pid_filepath.size() > 0);
 
@@ -59,15 +79,16 @@ int write_pid_file(const std::string &pid_filepath) {
     // pid-file only run if the checks here pass. Right now, this is guaranteed by the return on
     // failure here.
     if (!pid_file.empty()) {
-        fprintf(stderr, "ERROR: Attempting to write pid-file twice.\n");
+        logERR("Attempting to write pid-file twice.");
         return EXIT_FAILURE;
     }
-    if (!access(pid_filepath.c_str(), F_OK)) {
-        fprintf(stderr, "ERROR: The pid-file specified already exists. This might mean that an instance is already running.\n");
+
+    if (check_pid_file(pid_filepath) == EXIT_FAILURE) {
         return EXIT_FAILURE;
     }
+
     if (!numwrite(pid_filepath.c_str(), getpid())) {
-        fprintf(stderr, "ERROR: Writing to the specified pid-file failed.\n");
+        logERR("Writing to the specified pid-file failed.");
         return EXIT_FAILURE;
     }
     pid_file = pid_filepath;
@@ -106,40 +127,139 @@ boost::optional<std::string> get_optional_option(const std::map<std::string, opt
     return get_optional_option(opts, name, &source);
 }
 
+// Returns false if the group was not found.  This function replaces a call to
+// getgrnam(3).  That's right, getgrnam_r's interface is such that you have to
+// go through these shenanigans.
+bool get_group_id(const char *name, gid_t *group_id_out) {
+    // On Linux we can use sysconf to learn what the bufsize should be but on OS
+    // X we just have to guess.
+    size_t bufsize = 4096;
+    // I think 128 MB ought to be enough.
+    while (bufsize <= (1 << 17)) {
+        scoped_array_t<char> buf(bufsize);
+
+        struct group g;
+        struct group *result;
+        int res;
+        do {
+            res = getgrnam_r(name, &g, buf.data(), bufsize, &result);
+        } while (res == EINTR);
+
+        if (res == 0) {
+            if (result == NULL) {
+                return false;
+            } else {
+                *group_id_out = result->gr_gid;
+                return true;
+            }
+        } else if (res == ERANGE) {
+            bufsize *= 2;
+        } else {
+            // Here's what the man page says about error codes of getgrnam_r:
+            // 0 or ENOENT or ESRCH or EBADF or EPERM or ...
+            //        The given name or uid was not found.
+            //
+            // So let's just return false here.  I'm sure EMFILE and ENFILE and
+            // EIO will turn up again somewhere else.
+            return false;
+        }
+    }
+
+    rassert(false, "get_group_id bufsize overflow");
+    return false;
+}
+
+// Returns false if the user was not found.  This function replaces a call to
+// getpwnam(3).  That's right, getpwnam_r's interface is such that you have to
+// go through these shenanigans.
+bool get_user_ids(const char *name, int *user_id_out, gid_t *user_group_id_out) {
+    // On Linux we can use sysconf to learn what the bufsize should be but on OS
+    // X we just have to guess.
+    size_t bufsize = 4096;
+    // I think 128 MB ought to be enough.
+    while (bufsize <= (1 << 17)) {
+        scoped_array_t<char> buf(bufsize);
+
+        struct passwd p;
+        struct passwd *result;
+        int res;
+        do {
+            res = getpwnam_r(name, &p, buf.data(), bufsize, &result);
+        } while (res == EINTR);
+
+        if (res == 0) {
+            if (result == NULL) {
+                return false;
+            } else {
+                *user_id_out = result->pw_uid;
+                *user_group_id_out = result->pw_gid;
+                return true;
+            }
+        } else if (res == ERANGE) {
+            bufsize *= 2;
+        } else {
+            // Here's what the man page says about error codes of getpwnam_r:
+            // 0 or ENOENT or ESRCH or EBADF or EPERM or ...
+            //        The given name or uid was not found.
+            //
+            // So let's just return false here.  I'm sure EMFILE and ENFILE and
+            // EIO will turn up again somewhere else.
+            //
+            // (Yes, this is the same situation as with getgrnam_r, not some
+            // copy/paste.)
+            return false;
+        }
+    }
+
+    rassert(false, "get_user_ids bufsize overflow");
+    return false;
+}
+
+
 void set_user_group(const std::map<std::string, options::values_t> &opts) {
     boost::optional<std::string> rungroup = get_optional_option(opts, "--rungroup");
     boost::optional<std::string> runuser = get_optional_option(opts, "--runuser");
 
     if (rungroup) {
-        struct group *group_data = getgrnam(rungroup->c_str());
-        if (group_data == NULL) {
+        gid_t group_id;
+        if (!get_group_id(rungroup->c_str(), &group_id)) {
             throw std::runtime_error(strprintf("Group '%s' not found: %s",
                                                rungroup->c_str(), errno_string(errno).c_str()).c_str());
         }
-        if (setgid(group_data->gr_gid) != 0) {
+        if (setgid(group_id) != 0) {
             throw std::runtime_error(strprintf("Could not set group to '%s': %s",
                                                rungroup->c_str(), errno_string(errno).c_str()).c_str());
         }
     }
 
     if (runuser) {
-        struct passwd *user_data = getpwnam(runuser->c_str());
-        if (user_data == NULL) {
+        int user_id;
+        gid_t user_group_id;
+        if (!get_user_ids(runuser->c_str(), &user_id, &user_group_id)) {
             throw std::runtime_error(strprintf("User '%s' not found: %s",
                                                runuser->c_str(), errno_string(errno).c_str()).c_str());
         }
         if (!rungroup) {
             // No group specified, use the user's group
-            if (setgid(user_data->pw_gid) != 0) {
+            if (setgid(user_group_id) != 0) {
                 throw std::runtime_error(strprintf("Could not use the group of user '%s': %s",
                                                    runuser->c_str(), errno_string(errno).c_str()).c_str());
             }
         }
-        if (setuid(user_data->pw_uid) != 0) {
+        if (setuid(user_id) != 0) {
             throw std::runtime_error(strprintf("Could not set user account to '%s': %s",
                                                runuser->c_str(), errno_string(errno).c_str()).c_str());
         }
     }
+}
+
+int check_pid_file(const std::map<std::string, options::values_t> &opts) {
+    boost::optional<std::string> pid_filepath = get_optional_option(opts, "--pid-file");
+    if (!pid_filepath || pid_filepath->empty()) {
+        return EXIT_SUCCESS;
+    }
+
+    return check_pid_file(*pid_filepath);
 }
 
 // Maybe writes a pid file, using the --pid-file option, if it's present.
@@ -209,12 +329,32 @@ bool exists_option(const std::map<std::string, options::values_t> &opts, const s
     return it != opts.end() && !it->second.values.empty();
 }
 
-serializer_filepath_t metadata_file(const base_path_t& dirpath) {
+void print_version_message() {
+    printf("%s\n", RETHINKDB_VERSION_STR);
+}
+
+bool handle_help_or_version_option(const std::map<std::string, options::values_t> &opts,
+                                   void (*help_fn)()) {
+    if (exists_option(opts, "--help")) {
+        help_fn();
+        return true;
+    } else if (exists_option(opts, "--version")) {
+        print_version_message();
+        return true;
+    }
+    return false;
+}
+
+serializer_filepath_t get_cluster_metadata_filename(const base_path_t& dirpath) {
     return serializer_filepath_t(dirpath, "metadata");
 }
 
+serializer_filepath_t get_auth_metadata_filename(const base_path_t& dirpath) {
+    return serializer_filepath_t(dirpath, "auth_metadata");
+}
+
 void initialize_logfile(const std::map<std::string, options::values_t> &opts,
-                               const base_path_t& dirpath) {
+                        const base_path_t& dirpath) {
     std::string filename;
     if (exists_option(opts, "--log-file")) {
         filename = get_single_option(opts, "--log-file");
@@ -370,25 +510,37 @@ service_address_ports_t get_service_address_ports(const std::map<std::string, op
 }
 
 
-void run_rethinkdb_create(const base_path_t &base_path, const name_string_t &machine_name, const io_backend_t io_backend, bool *const result_out) {
+void run_rethinkdb_create(const base_path_t &base_path, const name_string_t &machine_name,
+                          bool *const result_out) {
     machine_id_t our_machine_id = generate_uuid();
-    logINF("Our machine ID: %s\n", uuid_to_str(our_machine_id).c_str());
 
-    cluster_semilattice_metadata_t metadata;
+    cluster_semilattice_metadata_t cluster_metadata;
+    auth_semilattice_metadata_t auth_metadata;
 
     machine_semilattice_metadata_t machine_semilattice_metadata;
     machine_semilattice_metadata.name = machine_semilattice_metadata.name.make_new_version(machine_name, our_machine_id);
     machine_semilattice_metadata.datacenter = vclock_t<datacenter_id_t>(nil_uuid(), our_machine_id);
-    metadata.machines.machines.insert(std::make_pair(our_machine_id, make_deletable(machine_semilattice_metadata)));
+    cluster_metadata.machines.machines.insert(std::make_pair(our_machine_id, make_deletable(machine_semilattice_metadata)));
 
-    scoped_ptr_t<io_backender_t> io_backender;
-    make_io_backender(io_backend, &io_backender);
+    io_backender_t io_backender;
 
     perfmon_collection_t metadata_perfmon_collection;
     perfmon_membership_t metadata_perfmon_membership(&get_global_perfmon_collection(), &metadata_perfmon_collection, "metadata");
 
+    perfmon_collection_t auth_perfmon_collection;
+    perfmon_membership_t auth_perfmon_membership(&get_global_perfmon_collection(), &metadata_perfmon_collection, "auth_metadata");
+
     try {
-        metadata_persistence::persistent_file_t store(io_backender.get(), metadata_file(base_path), &metadata_perfmon_collection, our_machine_id, metadata);
+        metadata_persistence::cluster_persistent_file_t cluster_metadata_file(&io_backender,
+                                                                              get_cluster_metadata_filename(base_path),
+                                                                              &metadata_perfmon_collection,
+                                                                              our_machine_id,
+                                                                              cluster_metadata);
+        metadata_persistence::auth_persistent_file_t auth_metadata_file(&io_backender,
+                                                                        get_auth_metadata_filename(base_path),
+                                                                        &auth_perfmon_collection,
+                                                                        auth_semilattice_metadata_t());
+        logINF("Our machine ID: %s\n", uuid_to_str(our_machine_id).c_str());
         logINF("Created directory '%s' and a metadata file inside it.\n", base_path.path().c_str());
         *result_out = true;
     } catch (const metadata_persistence::file_in_use_exc_t &ex) {
@@ -480,10 +632,10 @@ std::string uname_msr() {
 }
 
 void run_rethinkdb_serve(const base_path_t &base_path,
-                         const io_backend_t io_backend,
                          const serve_info_t& serve_info,
+                         const int max_concurrent_io_requests,
                          const machine_id_t *our_machine_id,
-                         const cluster_semilattice_metadata_t *semilattice_metadata,
+                         const cluster_semilattice_metadata_t *cluster_metadata,
                          bool *const result_out) {
     logINF("Running %s...\n", RETHINKDB_VERSION_STR);
     logINF("Running on %s", uname_msr().c_str());
@@ -497,33 +649,47 @@ void run_rethinkdb_serve(const base_path_t &base_path,
 
     logINF("Loading data from directory %s\n", base_path.path().c_str());
 
-    scoped_ptr_t<io_backender_t> io_backender;
-    make_io_backender(io_backend, &io_backender);
+    io_backender_t io_backender(max_concurrent_io_requests);
 
     perfmon_collection_t metadata_perfmon_collection;
     perfmon_membership_t metadata_perfmon_membership(&get_global_perfmon_collection(), &metadata_perfmon_collection, "metadata");
 
+    perfmon_collection_t auth_perfmon_collection;
+    perfmon_membership_t auth_perfmon_membership(&get_global_perfmon_collection(), &metadata_perfmon_collection, "auth_metadata");
+
     try {
-        scoped_ptr_t<metadata_persistence::persistent_file_t> store;
-        if (our_machine_id && semilattice_metadata) {
-            store.init(new metadata_persistence::persistent_file_t(io_backender.get(),
-                                                                   metadata_file(base_path),
-                                                                   &metadata_perfmon_collection,
-                                                                   *our_machine_id,
-                                                                   *semilattice_metadata));
+        scoped_ptr_t<metadata_persistence::cluster_persistent_file_t> cluster_metadata_file;
+        scoped_ptr_t<metadata_persistence::auth_persistent_file_t> auth_metadata_file;
+        if (our_machine_id && cluster_metadata) {
+            cluster_metadata_file.init(
+                new metadata_persistence::cluster_persistent_file_t(&io_backender,
+                                                                    get_cluster_metadata_filename(base_path),
+                                                                    &metadata_perfmon_collection,
+                                                                    *our_machine_id,
+                                                                    *cluster_metadata));
+            auth_metadata_file.init(
+                new metadata_persistence::auth_persistent_file_t(&io_backender,
+                                                                 get_auth_metadata_filename(base_path),
+                                                                 &auth_perfmon_collection,
+                                                                 auth_semilattice_metadata_t()));
         } else {
-            store.init(new metadata_persistence::persistent_file_t(io_backender.get(),
-                                                                   metadata_file(base_path),
-                                                                   &metadata_perfmon_collection));
+            cluster_metadata_file.init(
+                new metadata_persistence::cluster_persistent_file_t(&io_backender,
+                                                                    get_cluster_metadata_filename(base_path),
+                                                                    &metadata_perfmon_collection));
+            auth_metadata_file.init(
+                new metadata_persistence::auth_persistent_file_t(&io_backender,
+                                                                 get_auth_metadata_filename(base_path),
+                                                                 &auth_perfmon_collection));
         }
 
         *result_out = serve(serve_info.spawner_info,
-                            io_backender.get(),
-                            base_path, store.get(),
+                            &io_backender,
+                            base_path,
+                            cluster_metadata_file.get(),
+                            auth_metadata_file.get(),
                             look_up_peers_addresses(*serve_info.joins),
                             serve_info.ports,
-                            store->read_machine_id(),
-                            store->read_metadata(),
                             serve_info.web_assets,
                             &sigint_cond,
                             serve_info.config_file);
@@ -539,23 +705,26 @@ void run_rethinkdb_serve(const base_path_t &base_path,
 
 void run_rethinkdb_porcelain(const base_path_t &base_path,
                              const name_string_t &machine_name,
-                             const io_backend_t io_backend,
+                             const int max_concurrent_io_requests,
                              const bool new_directory,
                              const serve_info_t &serve_info,
                              bool *const result_out) {
     if (!new_directory) {
-        run_rethinkdb_serve(base_path, io_backend, serve_info, NULL, NULL, result_out);
+        run_rethinkdb_serve(base_path, serve_info, max_concurrent_io_requests,
+                            NULL, NULL,
+                            result_out);
     } else {
         logINF("Creating directory %s\n", base_path.path().c_str());
 
         machine_id_t our_machine_id = generate_uuid();
 
-        cluster_semilattice_metadata_t semilattice_metadata;
+        cluster_semilattice_metadata_t cluster_metadata;
 
         machine_semilattice_metadata_t our_machine_metadata;
         our_machine_metadata.name = vclock_t<name_string_t>(machine_name, our_machine_id);
         our_machine_metadata.datacenter = vclock_t<datacenter_id_t>(nil_uuid(), our_machine_id);
-        semilattice_metadata.machines.machines.insert(std::make_pair(our_machine_id, make_deletable(our_machine_metadata)));
+        cluster_metadata.machines.machines.insert(std::make_pair(our_machine_id, make_deletable(our_machine_metadata)));
+
         if (serve_info.joins->empty()) {
             logINF("Creating a default database for your convenience. (This is because you ran 'rethinkdb' "
                    "without 'create', 'serve', or '--join', and the directory '%s' did not already exist.)\n",
@@ -568,13 +737,14 @@ void run_rethinkdb_porcelain(const base_path_t &base_path,
             bool db_name_success = db_name.assign_value("test");
             guarantee(db_name_success);
             database_metadata.name = vclock_t<name_string_t>(db_name, our_machine_id);
-            semilattice_metadata.databases.databases.insert(std::make_pair(
+            cluster_metadata.databases.databases.insert(std::make_pair(
                 database_id,
                 deletable_t<database_semilattice_metadata_t>(database_metadata)));
         }
 
-        run_rethinkdb_serve(base_path, io_backend, serve_info,
-                            &our_machine_id, &semilattice_metadata, result_out);
+        run_rethinkdb_serve(base_path, serve_info,
+                            max_concurrent_io_requests,
+                            &our_machine_id, &cluster_metadata, result_out);
     }
 }
 
@@ -586,7 +756,6 @@ void run_rethinkdb_proxy(const serve_info_t &serve_info, bool *const result_out)
         *result_out = serve_proxy(serve_info.spawner_info,
                                   look_up_peers_addresses(*serve_info.joins),
                                   serve_info.ports,
-                                  generate_uuid(), cluster_semilattice_metadata_t(),
                                   serve_info.web_assets,
                                   &sigint_cond,
                                   serve_info.config_file);
@@ -622,6 +791,11 @@ options::help_section_t get_file_options(std::vector<options::option_t> *options
                                              options::OPTIONAL,
                                              "rethinkdb_data"));
     help.add("-d [ --directory ] path", "specify directory to store data and metadata");
+    options_out->push_back(options::option_t(options::names_t("--io-threads"),
+                                             options::OPTIONAL,
+                                             strprintf("%d", DEFAULT_MAX_CONCURRENT_IO_REQUESTS)));
+    help.add("--io-threads n",
+             "how many simultaneous I/O operations can happen at the same time");
     return help;
 }
 
@@ -709,21 +883,6 @@ options::help_section_t get_network_options(const bool join_required, std::vecto
     return help;
 }
 
-void get_disk_options(std::vector<options::help_section_t> *help_out,
-                      std::vector<options::option_t> *options_out) {
-    options_out->push_back(options::option_t(options::names_t("--io-backend"),
-                                             options::OPTIONAL,
-                                             "pool"));
-
-#ifdef AIOSUPPORT
-    options::help_section_t help("Disk I/O options");
-    help.add("--io-backend backend", "event backend to use: native or pool");
-    help_out->push_back(help);
-#else
-    (void)help_out;
-#endif
-}
-
 options::help_section_t get_cpu_options(std::vector<options::option_t> *options_out) {
     options::help_section_t help("CPU options");
     options_out->push_back(options::option_t(options::names_t("--cores", "-c"),
@@ -731,6 +890,17 @@ options::help_section_t get_cpu_options(std::vector<options::option_t> *options_
                                              strprintf("%d", get_cpu_count())));
     help.add("-c [ --cores ] n", "the number of cores to use");
     return help;
+}
+
+MUST_USE bool parse_cores_option(const std::map<std::string, options::values_t> &opts,
+                                 int *num_workers_out) {
+    int num_workers = get_single_int(opts, "--cores");
+    if (num_workers <= 0 || num_workers > MAX_THREADS) {
+        fprintf(stderr, "ERROR: number specified for cores to use must be between 1 and %d\n", MAX_THREADS);
+        return false;
+    }
+    *num_workers_out = num_workers;
+    return true;
 }
 
 options::help_section_t get_service_options(std::vector<options::option_t> *options_out) {
@@ -760,7 +930,10 @@ options::help_section_t get_help_options(std::vector<options::option_t> *options
     options::help_section_t help("Help options");
     options_out->push_back(options::option_t(options::names_t("--help", "-h"),
                                              options::OPTIONAL_NO_PARAMETER));
+    options_out->push_back(options::option_t(options::names_t("--version", "-v"),
+                                             options::OPTIONAL_NO_PARAMETER));
     help.add("-h [ --help ]", "print this help");
+    help.add("-v [ --version ]", "print the version number of rethinkdb");
     return help;
 }
 
@@ -768,7 +941,6 @@ void get_rethinkdb_create_options(std::vector<options::help_section_t> *help_out
                                   std::vector<options::option_t> *options_out) {
     help_out->push_back(get_file_options(options_out));
     help_out->push_back(get_machine_options(options_out));
-    get_disk_options(help_out, options_out);
     help_out->push_back(get_setuser_options(options_out));
     help_out->push_back(get_help_options(options_out));
     help_out->push_back(get_log_options(options_out));
@@ -780,7 +952,6 @@ void get_rethinkdb_serve_options(std::vector<options::help_section_t> *help_out,
     help_out->push_back(get_file_options(options_out));
     help_out->push_back(get_network_options(false, options_out));
     help_out->push_back(get_web_options(options_out));
-    get_disk_options(help_out, options_out);
     help_out->push_back(get_cpu_options(options_out));
     help_out->push_back(get_service_options(options_out));
     help_out->push_back(get_setuser_options(options_out));
@@ -870,30 +1041,12 @@ void get_rethinkdb_porcelain_options(std::vector<options::help_section_t> *help_
     help_out->push_back(get_machine_options(options_out));
     help_out->push_back(get_network_options(false, options_out));
     help_out->push_back(get_web_options(options_out));
-    get_disk_options(help_out, options_out);
     help_out->push_back(get_cpu_options(options_out));
     help_out->push_back(get_service_options(options_out));
     help_out->push_back(get_setuser_options(options_out));
     help_out->push_back(get_help_options(options_out));
     help_out->push_back(get_log_options(options_out));
     help_out->push_back(get_config_file_options(options_out));
-}
-
-io_backend_t get_io_backend_option(const std::map<std::string, options::values_t> &opts) {
-    std::string source;
-    const std::string value = get_single_option(opts, "--io-backend", &source);
-
-    if (value == "pool") {
-        return aio_pool;
-#ifdef AIOSUPPORT
-    } else if (value == "native") {
-        return aio_native;
-#endif
-    } else {
-        throw options::value_error_t(source, "--io-backend",
-                                     strprintf("Option '--io-backend' has invalid value '%s'",
-                                               value.c_str()));
-    }
 }
 
 std::map<std::string, options::values_t> parse_config_file_flat(const std::string &config_filepath,
@@ -949,16 +1102,13 @@ int main_rethinkdb_create(int argc, char *argv[]) {
     try {
         std::map<std::string, options::values_t> opts = parse_commands_deep(argc - 2, argv + 2, options);
 
-        if (exists_option(opts, "--help")) {
-            help_rethinkdb_create();
+        if (handle_help_or_version_option(opts, &help_rethinkdb_create)) {
             return EXIT_SUCCESS;
         }
 
         options::verify_option_counts(options, opts);
 
         set_user_group(opts);
-
-        io_backend_t io_backend = get_io_backend_option(opts);
 
         base_path_t base_path(get_single_option(opts, "--directory"));
 
@@ -988,7 +1138,7 @@ int main_rethinkdb_create(int argc, char *argv[]) {
         initialize_logfile(opts, base_path);
 
         bool result;
-        run_in_thread_pool(boost::bind(&run_rethinkdb_create, base_path, machine_name, io_backend, &result),
+        run_in_thread_pool(boost::bind(&run_rethinkdb_create, base_path, machine_name, &result),
                            num_workers);
         return result ? EXIT_SUCCESS : EXIT_FAILURE;
     } catch (const options::named_error_t &ex) {
@@ -1038,6 +1188,19 @@ bool maybe_daemonize(const std::map<std::string, options::values_t> &opts) {
     return true;
 }
 
+MUST_USE bool parse_io_threads_option(const std::map<std::string, options::values_t> &opts,
+                                      int *max_concurrent_io_requests_out) {
+    int max_concurrent_io_requests = get_single_int(opts, "--io-threads");
+    if (max_concurrent_io_requests <= 0
+        || max_concurrent_io_requests > MAXIMUM_MAX_CONCURRENT_IO_REQUESTS) {
+        fprintf(stderr, "ERROR: io-threads must be between 1 and %lld\n",
+                MAXIMUM_MAX_CONCURRENT_IO_REQUESTS);
+        return false;
+    }
+    *max_concurrent_io_requests_out = max_concurrent_io_requests;
+    return true;
+}
+
 int main_rethinkdb_serve(int argc, char *argv[]) {
     std::vector<options::option_t> options;
     std::vector<options::help_section_t> help;
@@ -1046,8 +1209,7 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
     try {
         std::map<std::string, options::values_t> opts = parse_commands_deep(argc - 2, argv + 2, options);
 
-        if (exists_option(opts, "--help")) {
-            help_rethinkdb_serve();
+        if (handle_help_or_version_option(opts, &help_rethinkdb_serve)) {
             return EXIT_SUCCESS;
         }
 
@@ -1063,11 +1225,13 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
 
         const std::string web_path = get_web_path(opts, argv);
 
-        io_backend_t io_backend = get_io_backend_option(opts);
+        int num_workers;
+        if (!parse_cores_option(opts, &num_workers)) {
+            return EXIT_FAILURE;
+        }
 
-        const int num_workers = get_single_int(opts, "--cores");
-        if (num_workers <= 0 || num_workers > MAX_THREADS) {
-            fprintf(stderr, "ERROR: number specified for cores to utilize must be between 1 and %d\n", MAX_THREADS);
+        int max_concurrent_io_requests;
+        if (!parse_io_threads_option(opts, &max_concurrent_io_requests)) {
             return EXIT_FAILURE;
         }
 
@@ -1080,6 +1244,10 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
 
         base_path.make_absolute();
         initialize_logfile(opts, base_path);
+
+        if (check_pid_file(opts) != EXIT_SUCCESS) {
+            return EXIT_FAILURE;
+        }
 
         if (!maybe_daemonize(opts)) {
             // This is the parent process of the daemon, just exit
@@ -1098,8 +1266,8 @@ int main_rethinkdb_serve(int argc, char *argv[]) {
 
         bool result;
         run_in_thread_pool(boost::bind(&run_rethinkdb_serve, base_path,
-                                       io_backend,
                                        serve_info,
+                                       max_concurrent_io_requests,
                                        static_cast<machine_id_t*>(NULL),
                                        static_cast<cluster_semilattice_metadata_t*>(NULL),
                                        &result),
@@ -1166,8 +1334,7 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
     try {
         std::map<std::string, options::values_t> opts = parse_commands_deep(argc - 2, argv + 2, options);
 
-        if (exists_option(opts, "--help")) {
-            help_rethinkdb_proxy();
+        if (handle_help_or_version_option(opts, &help_rethinkdb_proxy)) {
             return EXIT_SUCCESS;
         }
 
@@ -1191,6 +1358,10 @@ int main_rethinkdb_proxy(int argc, char *argv[]) {
 
         const std::string web_path = get_web_path(opts, argv);
         const int num_workers = get_cpu_count();
+
+        if (check_pid_file(opts) != EXIT_SUCCESS) {
+            return EXIT_FAILURE;
+        }
 
         if (!maybe_daemonize(opts)) {
             // This is the parent process of the daemon, just exit
@@ -1249,8 +1420,7 @@ int main_rethinkdb_import(int argc, char *argv[]) {
     try {
         std::map<std::string, options::values_t> opts = parse_commands_deep(argc - 2, argv + 2, options);
 
-        if (exists_option(opts, "--help")) {
-            help_rethinkdb_import();
+        if (handle_help_or_version_option(opts, &help_rethinkdb_import)) {
             return EXIT_SUCCESS;
         }
 
@@ -1360,8 +1530,7 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
     try {
         std::map<std::string, options::values_t> opts = parse_commands_deep(argc - 1, argv + 1, options);
 
-        if (exists_option(opts, "--help")) {
-            help_rethinkdb_porcelain();
+        if (handle_help_or_version_option(opts, help_rethinkdb_porcelain)) {
             return EXIT_SUCCESS;
         }
 
@@ -1384,11 +1553,13 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
 
         const std::string web_path = get_web_path(opts, argv);
 
-        io_backend_t io_backend = get_io_backend_option(opts);
+        int num_workers;
+        if (!parse_cores_option(opts, &num_workers)) {
+            return EXIT_FAILURE;
+        }
 
-        const int num_workers = get_single_int(opts, "--cores");
-        if (num_workers <= 0 || num_workers > MAX_THREADS) {
-            fprintf(stderr, "ERROR: number specified for cores to utilize must be between 1 and %d\n", MAX_THREADS);
+        int max_concurrent_io_requests;
+        if (!parse_io_threads_option(opts, &max_concurrent_io_requests)) {
             return EXIT_FAILURE;
         }
 
@@ -1407,6 +1578,10 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
 
         base_path.make_absolute();
         initialize_logfile(opts, base_path);
+
+        if (check_pid_file(opts) != EXIT_SUCCESS) {
+            return EXIT_FAILURE;
+        }
 
         if (!maybe_daemonize(opts)) {
             // This is the parent process of the daemon, just exit
@@ -1427,7 +1602,7 @@ int main_rethinkdb_porcelain(int argc, char *argv[]) {
         run_in_thread_pool(boost::bind(&run_rethinkdb_porcelain,
                                        base_path,
                                        machine_name,
-                                       io_backend,
+                                       max_concurrent_io_requests,
                                        new_directory,
                                        serve_info,
                                        &result),

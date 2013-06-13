@@ -5,30 +5,28 @@
 # We assemble path directives.
 LDPATHDS ?=
 CXXPATHDS ?=
+LDFLAGS ?=
+CXXFLAGS ?=
+RT_LDFLAGS := $(LDFLAGS) $(RE2_LIBS)
+RT_LDFLAGS += $(V8_LIBS) $(PROTOBUF_LIBS) $(TCMALLOC_MINIMAL_LIBS) $(PTHREAD_LIBS)
+RT_CXXFLAGS := $(CXXFLAGS) $(RE2_CXXFLAGS)
+
 ifeq ($(USE_CCACHE),1)
   RT_CXX := ccache $(CXX)
+  ifeq ($(COMPILER),CLANG)
+    RT_CXXFLAGS += -Qunused-arguments
+  endif
 else
   RT_CXX := $(CXX)
 endif
-LDFLAGS ?=
-CXXFLAGS ?=
-RT_LDFLAGS := $(LDFLAGS)
-RT_CXXFLAGS := $(CXXFLAGS)
 
 STATICFORCE := $(STATIC)
-
-ifeq ($(OS),Linux)
-  LDPTHREADFLAG := -pthread
-else
-  LDPTHREADFLAG :=
-endif
 
 ifeq ($(COMPILER),CLANG)
 
   ifeq ($(OS),Darwin)
     # TODO: ld: unknown option: --no-as-needed
     # RT_LDFLAGS += -Wl,--no-as-needed
-    RT_LDFLAGS += -lc++
   endif
 
   ifeq ($(STATICFORCE),1)
@@ -39,7 +37,7 @@ ifeq ($(COMPILER),CLANG)
     endif
   endif
 
-  RT_LDFLAGS += $(LDPATHDS) $(LDPTHREADFLAG) -lstdc++ -lm
+  RT_LDFLAGS += $(LDPATHDS) -lm
 
 else ifeq ($(COMPILER),INTEL)
   RT_LDFLAGS += -B/opt/intel/bin
@@ -52,7 +50,7 @@ else ifeq ($(COMPILER),INTEL)
     endif
   endif
 
-  RT_LDFLAGS += $(LDPATHDS) $(LDPTHREADFLAG) -lstdc++
+  RT_LDFLAGS += $(LDPATHDS) -lstdc++
 else ifeq ($(COMPILER),GCC)
 
   ifeq ($(OS),Linux)
@@ -67,11 +65,11 @@ else ifeq ($(COMPILER),GCC)
     endif
   endif
 
-  RT_LDFLAGS += $(LDPATHDS) $(LDPTHREADFLAG)
+  RT_LDFLAGS += $(LDPATHDS)
 endif
 
 ifeq ($(OS),Linux)
-  LIBRARY_PATHS += -lrt
+  RT_LDFLAGS += -lrt
 endif
 
 ifeq ($(STATICFORCE),1)
@@ -101,7 +99,6 @@ RT_LDFLAGS += $(LIB_SEARCH_PATHS)
 RT_CXXFLAGS?=
 RT_CXXFLAGS += -I$(SOURCE_DIR)
 RT_CXXFLAGS += -pthread
-RT_CXXFLAGS += -DBOOST_NO_CXX11_RVALUE_REFERENCES
 RT_CXXFLAGS += "-DPRODUCT_NAME=\"$(PRODUCT_NAME)\""
 RT_CXXFLAGS += -DWEB_ASSETS_DIR_NAME='"$(WEB_ASSETS_DIR_NAME)"'
 RT_CXXFLAGS += $(CXXPATHDS)
@@ -120,10 +117,6 @@ else ifeq ($(COMPILER), CLANG)
   RT_CXXFLAGS += -Wformat=2 -Wswitch-enum -Wswitch-default # -Wno-unneeded-internal-declaration
   RT_CXXFLAGS += -Wused-but-marked-unused -Wundef -Wvla -Wshadow
   RT_CXXFLAGS += -Wconditional-uninitialized -Wmissing-noreturn
-  ifeq ($(OS), Darwin)
-    RT_CXXFLAGS += -stdlib=libc++
-  endif
-
 else ifeq ($(COMPILER), GCC)
   ifeq ($(LEGACY_GCC), 1)
     RT_CXXFLAGS += -Wformat=2 -Wswitch-enum -Wswitch-default
@@ -163,6 +156,10 @@ ifeq ($(RT_COPY_NATIVE),1)
 endif
 ifeq ($(RT_REDUCE_NATIVE),1)
   RT_CXXFLAGS+=-march="$(GCC_ARCH_REDUCED)"
+endif
+
+ifeq ($(RQL_ERROR_BT),1)
+  RT_CXXFLAGS+=-DRQL_ERROR_BT
 endif
 
 # Configure debug vs. release
@@ -209,10 +206,6 @@ ifeq ($(SEMANTIC_SERIALIZER_CHECK),1)
   RT_CXXFLAGS += -DSEMANTIC_SERIALIZER_CHECK
 endif
 
-ifeq ($(MOCK_CACHE_CHECK),1)
-  RT_CXXFLAGS += -DMOCK_CACHE_CHECK
-endif
-
 ifeq ($(BTREE_DEBUG),1)
   RT_CXXFLAGS += -DBTREE_DEBUG
 endif
@@ -249,29 +242,11 @@ ifeq ($(NO_EPOLL),1)
   RT_CXXFLAGS += -DNO_EPOLL
 endif
 
-ifeq ($(MCHECK_PEDANTIC),1)
-  RT_CXXFLAGS += -DMCHECK_PEDANTIC
-  MCHECK := 1
-endif
-
-ifeq ($(MCHECK),1)
-  ifneq (1,$(NO_TCMALLOC))
-    $(error cannot build with MCHECK=1 when NO_TCMALLOC=0)
-  endif
-  RT_CXXFLAGS += -DMCHECK
-  RT_LDFLAGS += -lmcheck
-endif
-
 ifeq ($(VALGRIND),1)
   ifneq (1,$(NO_TCMALLOC))
     $(error cannot build with VALGRIND=1 when NO_TCMALLOC=0)
   endif
   RT_CXXFLAGS += -DVALGRIND
-endif
-
-ifeq ($(AIOSUPPORT),1)
-  RT_CXXFLAGS += -DAIOSUPPORT
-  RT_LDFLAGS += -laio
 endif
 
 ifeq ($(LEGACY_PROC_STAT),1)
@@ -350,11 +325,11 @@ rpc/semilattice/joins/macros.hpp rpc/serialize_macros.hpp rpc/mailbox/typed.hpp:
 .PHONY: rethinkdb
 rethinkdb: $(BUILD_DIR)/$(SERVER_EXEC_NAME)
 
-$(BUILD_DIR)/$(SERVER_EXEC_NAME): $(SERVER_EXEC_OBJS) | $(BUILD_DIR)/. $(TCMALLOC_DEP)
+$(BUILD_DIR)/$(SERVER_EXEC_NAME): $(SERVER_EXEC_OBJS) | $(BUILD_DIR)/. $(TCMALLOC_DEP) $(PROTOBUF_DEP)
 	$P LD $@
-	$(RT_CXX) $(RT_LDFLAGS) $(SERVER_EXEC_OBJS) $(LIBRARY_PATHS) -o $(BUILD_DIR)/$(SERVER_EXEC_NAME) $(LD_OUTPUT_FILTER)
+	$(RT_CXX) $(SERVER_EXEC_OBJS) $(RT_LDFLAGS) -o $(BUILD_DIR)/$(SERVER_EXEC_NAME) $(LD_OUTPUT_FILTER)
 ifeq ($(NO_TCMALLOC),0) # if we link to tcmalloc
-ifeq ($(filter -ltcmalloc%, $(LIBRARY_PATHS)),) # and it's not dynamic
+ifeq ($(filter -l%, $(TCMALLOC_MINIMAL_LIBS)),) # and it's not dynamic
 # TODO: c++filt may not be installed
 	@objdump -T $(BUILD_DIR)/$(SERVER_EXEC_NAME) | c++filt | grep -q 'tcmalloc::\|google_malloc' || \
 		(echo "    Failed to link in TCMalloc. You may have to run ./configure with the --without-tcmalloc flag." && \
@@ -368,7 +343,7 @@ $(OBJ_DIR)/unittest/%.o: RT_CXXFLAGS := $(filter-out -Wswitch-default,$(RT_CXXFL
 
 $(BUILD_DIR)/$(SERVER_UNIT_TEST_NAME): $(SERVER_UNIT_TEST_OBJS) $(UNIT_STATIC_LIBRARY_PATH) | $(BUILD_DIR)/. $(TCMALLOC_DEP)
 	$P LD $@
-	$(RT_CXX) $(RT_LDFLAGS) $(SERVER_UNIT_TEST_OBJS) $(UNIT_STATIC_LIBRARY_PATH) $(LIBRARY_PATHS) -o $@ $(LD_OUTPUT_FILTER)
+	$(RT_CXX) $(SERVER_UNIT_TEST_OBJS) $(RT_LDFLAGS) $(UNIT_STATIC_LIBRARY_PATH) -o $@ $(LD_OUTPUT_FILTER)
 
 $(BUILD_DIR)/$(GDB_FUNCTIONS_NAME):
 	$P CP $@
@@ -379,7 +354,7 @@ $(OBJ_DIR)/%.pb.o: $(PROTO_DIR)/%.pb.cc $(MAKEFILE_DEPENDENCY) $(QL2_PROTO_HEADE
 	$P CC $< -o $@
 	$(RT_CXX) $(RT_CXXFLAGS) -c -o $@ $<
 
-$(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cc $(MAKEFILE_DEPENDENCY) $(V8_DEP) | $(QL2_PROTO_OBJS)
+$(OBJ_DIR)/%.o: $(SOURCE_DIR)/%.cc $(MAKEFILE_DEPENDENCY) $(V8_DEP) $(RE2_DEP) | $(QL2_PROTO_OBJS)
 	mkdir -p $(dir $@) $(dir $(DEP_DIR)/$*)
 	$P CC $< -o $@
 	$(RT_CXX) $(RT_CXXFLAGS) -c -o $@ $< \

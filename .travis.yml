@@ -3,6 +3,9 @@ language: cpp
 compiler:
   - gcc
   - clang
+env:
+  - DEBUG=1
+  - DEBUG=0
 
 # Install build dependencies
 before_script:
@@ -22,11 +25,22 @@ before_script:
 # Build script
 script:
   - ./configure
-  - make -j 3 test-deps
-  - make test TEST=travis RUN_TEST_ARGS='-j3 -w-'
+  - make -j 3 test-deps DEBUG=$DEBUG
+  - make test TEST=travis RUN_TEST_ARGS='-j3 -w-' DEBUG=$DEBUG
 
-# Notify only on change
 notifications:
+  # Email commit author only on build status change
   email:
     on_success: change
     on_failure: change
+
+  # Always ping a webhook when something is broken. The webhook looks
+  # only for builds in next, and notifies everyone on the dev team
+  # that next is broken. This isn't currently possible directly with
+  # Travis.
+  webhooks:
+    urls:
+      - https://zapier.com/hooks/catch/n/ux03n/
+    on_success: never
+    on_failure: always
+
